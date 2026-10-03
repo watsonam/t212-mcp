@@ -29,18 +29,22 @@ The instrument list is cached for 24 hours in `~/.cache/t212-mcp/instruments-<en
 
 Placing an order takes two calls. A `preview_*` tool checks the order and returns the ticker, name, side, quantity, estimated GBP value and a token. `confirm_order` with that token asks you to approve the order, then places it. A token works once and expires after 5 minutes.
 
-The approval question comes from the server through MCP elicitation, so Claude cannot answer it for you. `cancel_order` asks the same way. If you decline, nothing is sent. If the MCP client cannot show the question, the order is refused.
+The approval question comes from the server through MCP elicitation, so Claude cannot answer it for you. It works with clients on older and newer MCP protocol versions. `cancel_order` asks the same way. If you decline or dismiss the question, nothing is sent. If the MCP client cannot show the question, the order is refused.
+
+Approval is only as strong as your MCP client. A client set to accept server questions automatically, or one that lets the model answer them, defeats it.
 
 The server enforces these rules:
 
 - Live order tools are off unless `T212_LIVE_TRADING=1` is set. With `T212_ENV=demo` they are always on.
+- Order tools only work on a GBP account.
 - Each order has a GBP cap (default £1,000), and so does each day (default £2,000). Both apply to buys and sells.
-- There is no price quote endpoint, so a value is only estimated where it can be bounded. A market buy needs a position already held, priced at `walletImpact.currentValue / quantity`. A limit or stop-limit buy is valued at quantity times the limit price, converted to GBP.
+- There is no price quote endpoint, so a value is only estimated where it can be bounded. A market order needs a position already held, priced at `walletImpact.currentValue / quantity` plus 5% for price movement. A limit or stop-limit order is valued at quantity times the limit price, converted to GBP.
+- A holding worth less than £1 is not used for pricing, since its rounded value gives an unreliable price.
 - A stop buy is refused, because its fill price has no bound. Use a stop-limit order.
-- A limit price in USD or another foreign currency is converted at the rate implied by a held position in that currency. With no such position, the order is refused.
+- A limit price in USD or another foreign currency is converted at the rate implied by the largest held position in that currency. With no such position, the order is refused. A limit price for a London share quoted in pence (GBX) is in pence.
 - A sell larger than the quantity available for trading is refused.
-- An order request is never retried. On a timeout, a 408 or a 5xx response, the tool says the outcome is unknown, and the order counts toward the daily cap. Check `get_pending_orders` and `get_order_history` before trying again.
-- Every preview, request, response and cancellation is appended to `~/.local/state/t212-mcp/orders-<env>.jsonl`. The daily cap is read from this log.
+- An order request is never retried. On a timeout, a 408 or a 5xx response, or an unreadable response, the tool says the outcome is unknown, and the order counts toward the daily cap. Check `get_pending_orders` and `get_order_history` before trying again. A cancellation with no answer is reported the same way.
+- Every preview, request, response and cancellation is appended to `~/.local/state/t212-mcp/orders-<env>.jsonl`. The daily cap is read from this log, per local calendar day. On macOS and Linux the log is locked while the daily cap is checked, so two sessions cannot both pass it at once. Windows has no such lock.
 
 To change the caps, create `~/.config/t212-mcp/config.toml`. The server refuses to start if the file is not valid TOML, names an unknown setting, or sets a cap that is not a positive number:
 

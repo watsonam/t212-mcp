@@ -2,6 +2,7 @@ import json
 import os
 import time
 
+import httpx
 import pytest
 from mcp.server.mcpserver.exceptions import ToolError
 
@@ -55,6 +56,26 @@ async def test_corrupt_cache_is_refetched(account, make_server, call, tmp_path):
 async def test_cache_that_is_not_text_is_refetched(account, make_server, call, tmp_path):
     (tmp_path / "instruments.json").write_bytes(b"\xff\xfe\x00")
     assert [i["ticker"] for i in await call(make_server(), "search_instruments", {"query": "apple"})] == ["AAPL_US_EQ"]
+
+
+async def test_order_history_passes_cursor_and_limit(api, server, call):
+    route = api.get("history/orders").respond(json={"items": [], "nextPagePath": None})
+    await call(server, "get_order_history", {"cursor": 99, "limit": 50, "ticker": "AAPL_US_EQ"})
+    assert dict(route.calls.last.request.url.params) == {"cursor": "99", "limit": "50", "ticker": "AAPL_US_EQ"}
+
+
+@pytest.mark.parametrize(("tool", "args"), [("get_order_history", {"limit": 0}), ("get_order_history", {"limit": 51}), ("search_instruments", {"query": "a", "limit": -1})])
+async def test_limits_out_of_range_are_refused(account, server, call, tool, args):
+    route = account.get("history/orders").respond(json={"items": [], "nextPagePath": None})
+    with pytest.raises(ToolError):
+        await call(server, tool, args)
+    assert route.call_count == 0
+
+
+async def test_read_tool_network_error_says_no_answer(api, server, call):
+    api.get("positions").mock(side_effect=httpx.ReadTimeout("slow"))
+    with pytest.raises(ToolError, match="No answer"):
+        await call(server, "get_positions")
 
 
 async def test_api_errors_become_tool_errors(api, server, call):

@@ -4,7 +4,7 @@ import tomllib
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, fields
 from pathlib import Path
-from typing import Literal, get_args
+from typing import Literal, cast, get_args
 
 Environment = Literal["demo", "live"]
 BASE_URLS: dict[Environment, str] = {"demo": "https://demo.trading212.com", "live": "https://live.trading212.com"}
@@ -74,7 +74,7 @@ def load_settings(environ: Mapping[str, str] = os.environ, keychain: Callable[[s
     config_path = Path(environ.get("T212_CONFIG", Path.home() / ".config" / "t212-mcp" / "config.toml"))
     rules = TradingRules(enabled=env == "demo" or environ.get("T212_LIVE_TRADING") == "1", **read_caps(config_path))
     return Settings(
-        env=env,
+        env=cast(Environment, env),
         api_key=secret("api_key"),
         api_secret=secret("api_secret"),
         cache_dir=Path(environ.get("T212_CACHE_DIR", Path.home() / ".cache" / "t212-mcp")),
