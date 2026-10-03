@@ -1,7 +1,8 @@
+import math
 import os
 import tomllib
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Literal, get_args
 
@@ -21,7 +22,7 @@ class TradingRules:
     max_daily_gbp: float = 2000
 
 
-CAP_NAMES = {"max_order_gbp", "max_daily_gbp"}
+CAP_NAMES = {f.name for f in fields(TradingRules)} - {"enabled"}
 
 
 @dataclass(frozen=True)
@@ -54,7 +55,7 @@ def read_caps(path: Path) -> dict[str, float]:
     if unknown := set(caps) - CAP_NAMES:
         raise ConfigError(f"{path} has unknown settings {sorted(unknown)}; allowed: {sorted(CAP_NAMES)}")
     for name, value in caps.items():
-        if isinstance(value, bool) or not isinstance(value, int | float) or value <= 0:
+        if isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(value) or value <= 0:
             raise ConfigError(f"{path}: {name} must be a positive number, got {value!r}")
     return caps
 

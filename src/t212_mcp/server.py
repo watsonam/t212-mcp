@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import time
 from pathlib import Path
 from typing import Any, Literal
@@ -11,7 +12,7 @@ from mcp.shared.exceptions import MCPError
 from pydantic import BaseModel
 
 from t212_mcp.client import T212Client
-from t212_mcp.config import TradingRules, load_settings
+from t212_mcp.config import Settings, TradingRules, load_settings
 from t212_mcp.orders import Approve, OrderDesk, position_price_gbp
 
 INSTRUMENT_CACHE_SECONDS = 86400
@@ -51,11 +52,11 @@ def create_server(client: T212Client, instrument_cache: Path, order_log: Path, r
         if instrument_cache.exists() and time.time() - instrument_cache.stat().st_mtime < INSTRUMENT_CACHE_SECONDS:
             try:
                 return json.loads(instrument_cache.read_text(encoding="utf-8"))
-            except json.JSONDecodeError:
+            except ValueError:
                 pass
         items = await client.instruments()
         instrument_cache.parent.mkdir(parents=True, exist_ok=True)
-        partial = instrument_cache.with_suffix(".tmp")
+        partial = instrument_cache.with_suffix(f".{os.getpid()}.tmp")
         partial.write_text(json.dumps(items), encoding="utf-8")
         partial.replace(instrument_cache)
         return items
@@ -132,10 +133,13 @@ def create_server(client: T212Client, instrument_cache: Path, order_log: Path, r
     return server
 
 
-def main() -> None:
-    settings = load_settings()
+async def serve(settings: Settings) -> None:
     client = T212Client(settings.base_url, settings.api_key, settings.api_secret)
     try:
-        create_server(client, settings.cache_dir / f"instruments-{settings.env}.json", settings.log_path, settings.rules).run()
+        await create_server(client, settings.cache_dir / f"instruments-{settings.env}.json", settings.log_path, settings.rules).run_stdio_async()
     finally:
-        asyncio.run(client.aclose())
+        await client.aclose()
+
+
+def main() -> None:
+    asyncio.run(serve(load_settings()))

@@ -65,6 +65,11 @@ async def test_spaces_concurrent_calls(api, spaced_client):
     assert time.monotonic() - start >= 0.4
 
 
+async def test_ignores_unreadable_rate_limit_reset(api, client):
+    api.get("orders").respond(json=[], headers={"x-ratelimit-remaining": "0", "x-ratelimit-reset": "soon"})
+    assert await client.pending_orders() == []
+
+
 async def test_waits_when_rate_limit_is_used_up(api, client):
     api.get("orders").respond(json=[], headers={"x-ratelimit-remaining": "0", "x-ratelimit-reset": str(time.time() + 0.3)})
     start = time.monotonic()

@@ -52,6 +52,11 @@ async def test_corrupt_cache_is_refetched(account, make_server, call, tmp_path):
     assert json.loads((tmp_path / "instruments.json").read_text(encoding="utf-8"))[0]["ticker"] == "VUSAl_EQ"
 
 
+async def test_cache_that_is_not_text_is_refetched(account, make_server, call, tmp_path):
+    (tmp_path / "instruments.json").write_bytes(b"\xff\xfe\x00")
+    assert [i["ticker"] for i in await call(make_server(), "search_instruments", {"query": "apple"})] == ["AAPL_US_EQ"]
+
+
 async def test_api_errors_become_tool_errors(api, server, call):
     api.get("account/summary").respond(403)
     with pytest.raises(ToolError, match="account"):
