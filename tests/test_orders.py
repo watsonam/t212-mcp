@@ -10,6 +10,8 @@ import pytest
 from mcp.server.mcpserver.exceptions import ToolError
 
 from conftest import INSTRUMENTS
+from t212_mcp.config import TradingRules
+from t212_mcp.orders import OrderDesk
 
 
 @pytest.fixture
@@ -282,9 +284,10 @@ async def test_spend_between_preview_and_confirm_is_counted(account, make_server
     server = make_server(max_daily_gbp=300)
     token = (await preview(server, "preview_market_order", ticker="VUSAl_EQ", quantity=2))["token"]
     write_log(tmp_path, {"time": now_iso(), "event": "sent", "token": "other", "valueGbp": 200})
+    questions = []
     with pytest.raises(ToolError, match="daily cap"):
-        await call(server, "confirm_order", {"token": token})
-    assert route.call_count == 0
+        await call(server, "confirm_order", {"token": token}, questions=questions)
+    assert (route.call_count, questions) == (0, [])
 
 
 async def test_order_exactly_at_the_caps_is_allowed(account, make_server, preview, call):
@@ -416,3 +419,10 @@ async def test_sent_entry_without_a_value_blocks_with_a_clear_error(account, mak
 async def test_non_object_log_lines_are_skipped(account, make_server, preview, tmp_path):
     write_log(tmp_path, "3", "[1, 2]", '"text"')
     assert (await preview(make_server(), "preview_market_order", ticker="VUSAl_EQ", quantity=1))["spentTodayGbp"] == 0
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), 0, -5])
+def test_caps_refuse_values_that_cannot_be_compared(client, tmp_path, value):
+    desk = OrderDesk(client, None, tmp_path / "orders.jsonl", TradingRules(enabled=True), 300)
+    with pytest.raises(ToolError, match="Cannot cap"):
+        desk._check_caps(value)

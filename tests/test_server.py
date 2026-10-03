@@ -66,8 +66,10 @@ async def test_order_history_passes_cursor_and_limit(api, server, call):
 
 @pytest.mark.parametrize(("tool", "args"), [("get_order_history", {"limit": 0}), ("get_order_history", {"limit": 51}), ("search_instruments", {"query": "a", "limit": -1})])
 async def test_limits_out_of_range_are_refused(account, server, call, tool, args):
+    route = account.get("history/orders").respond(json={"items": [], "nextPagePath": None})
     with pytest.raises(ToolError):
         await call(server, tool, args)
+    assert route.call_count == 0
 
 
 async def test_read_tool_network_error_says_no_answer(api, server, call):
