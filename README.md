@@ -2,6 +2,8 @@
 
 An MCP (Model Context Protocol) server for the Trading 212 public API. It lets Claude Code or Claude Desktop read a Trading 212 Stocks ISA and place orders with your approval.
 
+This project is not affiliated with or endorsed by Trading 212. It can place real trades with real money. It comes with no warranty (see [LICENSE](LICENSE)); you are responsible for every order it places.
+
 ## Tools
 
 | Tool | Endpoint | Scope |
@@ -106,4 +108,8 @@ Claude Desktop does not inherit your shell environment, so use the keychain or p
 uv run pytest
 ```
 
-HTTP calls are mocked with respx. The OpenAPI spec the code follows is in `spec/api.json`.
+HTTP calls are mocked with respx. The code follows Trading 212's OpenAPI spec, which is not included here. To download it for reference:
+
+```bash
+mkdir -p spec && curl -sfL https://docs.trading212.com/_spec/api.json -o spec/api.json
+```
