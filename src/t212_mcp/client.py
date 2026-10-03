@@ -41,9 +41,14 @@ class T212Client:
             self._next_allowed[rate_key] = time.monotonic() + self._min_intervals.get(rate_key, 0)
 
     def _note_rate_limit(self, rate_key: str, response: httpx.Response) -> None:
-        if response.headers.get("x-ratelimit-remaining") == "0" and (reset := response.headers.get("x-ratelimit-reset")):
-            wait = min(max(float(reset) - time.time(), 0), MAX_RATE_LIMIT_WAIT)
-            self._next_allowed[rate_key] = max(self._next_allowed.get(rate_key, 0), time.monotonic() + wait)
+        if response.headers.get("x-ratelimit-remaining") != "0":
+            return
+        try:
+            reset = float(response.headers.get("x-ratelimit-reset", ""))
+        except ValueError:
+            return
+        wait = min(max(reset - time.time(), 0), MAX_RATE_LIMIT_WAIT)
+        self._next_allowed[rate_key] = max(self._next_allowed.get(rate_key, 0), time.monotonic() + wait)
 
     async def _request(self, method: str, path: str, scope: str, rate_key: str | None = None, json: dict[str, Any] | None = None, **params: Any) -> Any:
         rate_key = rate_key or path

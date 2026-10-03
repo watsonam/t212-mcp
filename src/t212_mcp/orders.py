@@ -1,7 +1,10 @@
 import json
+import math
+import os
 import secrets
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -12,6 +15,11 @@ from mcp.server.mcpserver.exceptions import ToolError
 
 from t212_mcp.client import T212Client, T212Error, T212NoAnswer
 from t212_mcp.config import TradingRules
+
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
 
 OrderKind = Literal["market", "limit", "stop", "stop_limit"]
 Approve = Callable[[str], Awaitable[bool]]
@@ -43,29 +51,45 @@ class OrderDesk:
         self._token_seconds = token_seconds
         self._pending: dict[str, PendingOrder] = {}
 
-    def _log(self, event: str, **fields: Any) -> None:
+    def _log(self, event: str, sync: bool = False, **fields: Any) -> None:
         self._log_path.parent.mkdir(parents=True, exist_ok=True)
-        with self._log_path.open("a", encoding="utf-8") as log:
-            log.write(json.dumps({"time": datetime.now().astimezone().isoformat(), "event": event, **fields}) + "\n")
+        line = json.dumps({"time": datetime.now().astimezone().isoformat(), "event": event, **fields}) + "\n"
+        with self._log_path.open("a+b") as log:
+            if log.seek(0, os.SEEK_END) and (log.seek(-1, os.SEEK_END), log.read(1))[1] != b"\n":
+                line = "\n" + line
+            log.write(line.encode("utf-8"))
+            if sync:
+                log.flush()
+                os.fsync(log.fileno())
 
-    def _log_entries(self) -> list[dict[str, Any]]:
+    @contextmanager
+    def _log_lock(self) -> Iterator[None]:
+        if fcntl is None:
+            yield
+            return
+        self._log_path.parent.mkdir(parents=True, exist_ok=True)
+        with self._log_path.with_suffix(".lock").open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            yield
+
+    def _log_entries(self) -> Iterator[dict[str, Any]]:
         if not self._log_path.exists():
-            return []
-        entries = []
-        for line in self._log_path.read_text(encoding="utf-8").splitlines():
+            return
+        for line in self._log_path.read_text(encoding="utf-8", errors="replace").splitlines():
             try:
-                entries.append(json.loads(line))
+                yield json.loads(line)
             except json.JSONDecodeError:
                 continue
-        return entries
 
     def spent_today(self) -> float:
         today = datetime.now().astimezone().date().isoformat()
-        entries = self._log_entries()
+        entries = list(self._log_entries())
         rejected = {e.get("token") for e in entries if e.get("event") == "rejected"}
         return sum(e["valueGbp"] for e in entries if e.get("event") == "sent" and e["time"].startswith(today) and e["token"] not in rejected)
 
     def _check_caps(self, value: float) -> float:
+        if not math.isfinite(value) or value <= 0:
+            raise ToolError(f"Cannot cap an order with an estimated value of {value}")
         if value > self._rules.max_order_gbp:
             raise ToolError(f"Estimated £{value:,.2f} is over the per-order cap of £{self._rules.max_order_gbp:,.2f}")
         if (spent := self.spent_today()) + value > self._rules.max_daily_gbp:
@@ -78,8 +102,10 @@ class OrderDesk:
 
     async def preview(self, kind: OrderKind, ticker: str, quantity: float, terms: dict[str, Any]) -> dict[str, Any]:
         self._require_enabled()
-        if quantity == 0:
-            raise ToolError("quantity must not be zero: positive buys, negative sells")
+        if not math.isfinite(quantity) or quantity == 0:
+            raise ToolError("quantity must be a non-zero number: positive buys, negative sells")
+        if bad := [key for key in ("limitPrice", "stopPrice") if key in terms and not (math.isfinite(terms[key]) and terms[key] > 0)]:
+            raise ToolError(f"{' and '.join(bad)} must be above zero")
         instrument = next((i for i in await self._instruments() if i["ticker"] == ticker), None)
         if instrument is None:
             raise ToolError(f"Unknown ticker {ticker}; find it with search_instruments")
@@ -130,11 +156,12 @@ class OrderDesk:
             raise ToolError(DECLINED)
         if pending.expires <= time.monotonic():
             raise ToolError("The token expired while waiting for approval; preview the order again")
-        self._check_caps(pending.value_gbp)
-        self._log("sent", token=token, kind=pending.kind, body=pending.body, valueGbp=pending.value_gbp)
+        with self._log_lock():
+            self._check_caps(pending.value_gbp)
+            self._log("sent", sync=True, token=token, kind=pending.kind, body=pending.body, valueGbp=pending.value_gbp)
         try:
             order = await self._client.place_order(pending.kind, pending.body)
-        except (httpx.TransportError, T212NoAnswer, json.JSONDecodeError) as error:
+        except (httpx.RequestError, T212NoAnswer, ValueError) as error:
             self._log("unknown", token=token, error=repr(error), response=getattr(error, "response_text", ""))
             raise ToolError(NO_ANSWER) from error
         except T212Error as error:

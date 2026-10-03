@@ -57,7 +57,7 @@ def test_caps_from_config_file(tmp_path):
     assert (settings.rules.max_order_gbp, settings.rules.max_daily_gbp) == (250, 500)
 
 
-@pytest.mark.parametrize(("text", "message"), [("max_order_gbp = ", "not valid TOML"), ("max_order = 5", "unknown settings"), ("max_daily_gbp = -1", "positive number"), ("max_order_gbp = \"lots\"", "positive number")])
+@pytest.mark.parametrize(("text", "message"), [("max_order_gbp = ", "not valid TOML"), ("max_order = 5", "unknown settings"), ("max_daily_gbp = -1", "positive number"), ("max_order_gbp = \"lots\"", "positive number"), ("max_order_gbp = nan", "positive number"), ("max_daily_gbp = inf", "positive number")])
 def test_bad_config_file(tmp_path, text, message):
     config = tmp_path / "config.toml"
     config.write_text(text, encoding="utf-8")

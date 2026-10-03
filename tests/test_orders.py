@@ -190,8 +190,45 @@ async def test_corrupt_log_line_does_not_block_orders(account, make_server, prev
     assert (await call(server, "confirm_order", {"token": token}))["id"] == 1
 
 
-async def test_unreadable_success_response_is_unknown(account, make_server, preview, call, log):
-    route = account.post("orders/market").respond(200, text="<html>")
+async def test_entry_after_a_cut_off_line_is_kept(account, make_server, preview, tmp_path, log):
+    (tmp_path / "orders.jsonl").write_bytes('{"time": "2026-10-03T09:00:00+01:00", "event": "se'.encode())
+    await preview(make_server(), "preview_market_order", ticker="VUSAl_EQ", quantity=2)
+    lines = (tmp_path / "orders.jsonl").read_text(encoding="utf-8").splitlines()
+    assert json.loads(lines[-1])["event"] == "preview"
+
+
+async def test_sent_line_is_forced_to_disk(account, make_server, preview, call, monkeypatch):
+    account.post("orders/market").respond(json={"id": 1})
+    synced = []
+    monkeypatch.setattr("t212_mcp.orders.os.fsync", synced.append)
+    server = make_server()
+    token = (await preview(server, "preview_market_order", ticker="VUSAl_EQ", quantity=2))["token"]
+    await call(server, "confirm_order", {"token": token})
+    assert len(synced) == 1
+
+
+@pytest.mark.parametrize(("tool", "args"), [
+    ("preview_market_order", {"quantity": "NaN"}),
+    ("preview_limit_order", {"quantity": 1, "limit_price": -100}),
+    ("preview_limit_order", {"quantity": 1, "limit_price": 0}),
+    ("preview_limit_order", {"quantity": 1, "limit_price": "Infinity"}),
+    ("preview_stop_order", {"quantity": -1, "stop_price": -5}),
+])
+async def test_bad_numbers_are_refused(account, make_server, preview, tool, args):
+    with pytest.raises(ToolError, match="must be"):
+        await preview(make_server(), tool, ticker="VUSAl_EQ", **args)
+
+
+async def test_unreadable_rate_limit_header_after_order_is_not_an_error(account, make_server, preview, call):
+    account.post("orders/market").respond(json={"id": 1}, headers={"x-ratelimit-remaining": "0", "x-ratelimit-reset": "soon"})
+    server = make_server()
+    token = (await preview(server, "preview_market_order", ticker="VUSAl_EQ", quantity=2))["token"]
+    assert (await call(server, "confirm_order", {"token": token}))["id"] == 1
+
+
+@pytest.mark.parametrize(("body", "headers"), [(b"<html>", {}), (b"not gzip", {"content-encoding": "gzip"}), (b"\xff\xfe\xfa", {"content-type": "application/json"})])
+async def test_unreadable_success_response_is_unknown(account, make_server, preview, call, log, body, headers):
+    route = account.post("orders/market").mock(side_effect=lambda request: httpx.Response(200, headers=headers, stream=httpx.ByteStream(body)))
     server = make_server()
     token = (await preview(server, "preview_market_order", ticker="VUSAl_EQ", quantity=2))["token"]
     with pytest.raises(ToolError, match="Do not resend"):
