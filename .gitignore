@@ -10,3 +10,4 @@ dist/
 logs/
 .claude/settings.local.json
 spec/
+docs/research/
