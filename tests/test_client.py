@@ -2,9 +2,10 @@ import asyncio
 import base64
 import time
 
+import httpx
 import pytest
 
-from t212_mcp.client import T212Client, T212Error
+from t212_mcp.client import T212Client, T212Error, T212NoAnswer
 
 
 async def test_sends_basic_auth(api, client):
@@ -44,35 +45,55 @@ async def test_429_reports_reset(api, client):
 
 
 @pytest.fixture
+def waits(monkeypatch):
+    recorded = []
+    async def record(seconds):
+        recorded.append(seconds)
+    monkeypatch.setattr("t212_mcp.client.asyncio.sleep", record)
+    return recorded
+
+
+@pytest.fixture
 async def spaced_client(api):
-    client = T212Client("https://demo.trading212.com", "key", "secret", min_intervals={"positions": 0.2})
+    client = T212Client("https://demo.trading212.com", "key", "secret", min_intervals={"positions": 10})
     yield client
     await client.aclose()
 
 
-async def test_spaces_calls_to_same_endpoint(api, spaced_client):
+async def test_spaces_calls_to_same_endpoint(api, spaced_client, waits):
     api.get("positions").respond(json=[])
-    start = time.monotonic()
     await spaced_client.positions()
     await spaced_client.positions()
-    assert time.monotonic() - start >= 0.2
+    assert waits == [pytest.approx(10, abs=0.5)]
 
 
-async def test_spaces_concurrent_calls(api, spaced_client):
+async def test_spaces_concurrent_calls(api, spaced_client, waits):
     api.get("positions").respond(json=[])
-    start = time.monotonic()
     await asyncio.gather(spaced_client.positions(), spaced_client.positions(), spaced_client.positions())
-    assert time.monotonic() - start >= 0.4
+    assert len(waits) == 2
 
 
-async def test_ignores_unreadable_rate_limit_reset(api, client):
+async def test_ignores_unreadable_rate_limit_reset(api, client, waits):
     api.get("orders").respond(json=[], headers={"x-ratelimit-remaining": "0", "x-ratelimit-reset": "soon"})
     assert await client.pending_orders() == []
+    await client.pending_orders()
+    assert waits == []
 
 
-async def test_waits_when_rate_limit_is_used_up(api, client):
-    api.get("orders").respond(json=[], headers={"x-ratelimit-remaining": "0", "x-ratelimit-reset": str(time.time() + 0.3)})
-    start = time.monotonic()
+async def test_waits_when_rate_limit_is_used_up(api, client, waits):
+    api.get("orders").respond(json=[], headers={"x-ratelimit-remaining": "0", "x-ratelimit-reset": str(time.time() + 30)})
     await client.pending_orders()
     await client.pending_orders()
-    assert time.monotonic() - start >= 0.25
+    assert waits == [pytest.approx(30, abs=1)]
+
+
+async def test_network_error_is_no_answer(api, client):
+    api.get("positions").mock(side_effect=httpx.ConnectError("down"))
+    with pytest.raises(T212NoAnswer, match="No answer"):
+        await client.positions()
+
+
+async def test_unreadable_success_is_no_answer(api, client):
+    api.get("positions").respond(200, text="<html>")
+    with pytest.raises(T212NoAnswer, match="unreadable"):
+        await client.positions()

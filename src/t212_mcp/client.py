@@ -53,10 +53,16 @@ class T212Client:
     async def _request(self, method: str, path: str, scope: str, rate_key: str | None = None, json: dict[str, Any] | None = None, **params: Any) -> Any:
         rate_key = rate_key or path
         await self._wait_turn(rate_key)
-        response = await self._http.request(method, path, json=json, params={k: v for k, v in params.items() if v is not None})
+        try:
+            response = await self._http.request(method, path, json=json, params={k: v for k, v in params.items() if v is not None})
+        except httpx.RequestError as error:
+            raise T212NoAnswer(f"No answer from Trading 212 for {path}: {error!r}") from error
         self._note_rate_limit(rate_key, response)
         if response.is_success:
-            return response.json() if response.content else None
+            try:
+                return response.json() if response.content else None
+            except ValueError as error:
+                raise T212NoAnswer(f"Trading 212 sent an unreadable response for {path}", response.text[:500]) from error
         text = response.text[:500]
         match response.status_code:
             case 401:

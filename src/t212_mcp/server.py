@@ -3,20 +3,20 @@ import json
 import os
 import time
 from pathlib import Path
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 from urllib.parse import parse_qs, urlparse
 
-from mcp.server.mcpserver import Context, MCPServer
-from mcp.server.mcpserver.exceptions import ToolError
-from mcp.shared.exceptions import MCPError
-from pydantic import BaseModel
+from mcp.server.mcpserver import AcceptedElicitation, Elicit, ElicitationResult, MCPServer, Resolve
+from pydantic import BaseModel, Field
 
 from t212_mcp.client import T212Client
 from t212_mcp.config import Settings, TradingRules, load_settings
-from t212_mcp.orders import Approve, OrderDesk, position_price_gbp
+from t212_mcp.orders import OrderDesk, position_price_gbp
 
 INSTRUMENT_CACHE_SECONDS = 86400
 TimeValidity = Literal["DAY", "GOOD_TILL_CANCEL"]
+HistoryLimit = Annotated[int, Field(ge=1, le=50)]
+SearchLimit = Annotated[int, Field(ge=1, le=100)]
 INSTRUCTIONS = (
     "Trading 212 Stocks ISA. Tickers look like AAPL_US_EQ; find them with search_instruments, never guess. "
     "Orders are by share quantity: positive buys, negative sells. Every preview_* tool returns a preview and a token. "
@@ -35,33 +35,36 @@ def next_cursor(next_page_path: str | None) -> int | None:
     return int(cursor[0])
 
 
-def user_approval(ctx: Context) -> Approve:
-    async def approve(question: str) -> bool:
-        try:
-            answer = await ctx.elicit(question, Approval)
-        except MCPError as error:
-            raise ToolError(f"Could not ask the user to approve, so nothing was sent ({error}). The MCP client must support elicitation.") from error
-        return answer.action == "accept" and answer.data.approve
-    return approve
+def approved(answer: ElicitationResult[Approval]) -> bool:
+    return isinstance(answer, AcceptedElicitation) and answer.data.approve
 
 
 def create_server(client: T212Client, instrument_cache: Path, order_log: Path, rules: TradingRules = TradingRules(), token_seconds: float = 300) -> MCPServer:
     server = MCPServer("trading212", instructions=INSTRUCTIONS)
 
     async def instruments() -> list[dict[str, Any]]:
-        if instrument_cache.exists() and time.time() - instrument_cache.stat().st_mtime < INSTRUMENT_CACHE_SECONDS:
-            try:
+        try:
+            if time.time() - instrument_cache.stat().st_mtime < INSTRUMENT_CACHE_SECONDS:
                 return json.loads(instrument_cache.read_text(encoding="utf-8"))
-            except ValueError:
-                pass
+        except (OSError, ValueError):
+            pass
         items = await client.instruments()
         instrument_cache.parent.mkdir(parents=True, exist_ok=True)
         partial = instrument_cache.with_suffix(f".{os.getpid()}.tmp")
-        partial.write_text(json.dumps(items), encoding="utf-8")
-        partial.replace(instrument_cache)
+        try:
+            partial.write_text(json.dumps(items), encoding="utf-8")
+            partial.replace(instrument_cache)
+        finally:
+            partial.unlink(missing_ok=True)
         return items
 
     desk = OrderDesk(client, instruments, order_log, rules, token_seconds)
+
+    def ask_to_place(token: str) -> Elicit[Approval]:
+        return Elicit(desk.question(token), Approval)
+
+    def ask_to_cancel(order_id: int) -> Elicit[Approval]:
+        return Elicit(desk.cancel_question(order_id), Approval)
 
     @server.tool()
     async def get_account_summary() -> dict[str, Any]:
@@ -88,13 +91,13 @@ def create_server(client: T212Client, instrument_cache: Path, order_log: Path, r
         return await client.order(order_id)
 
     @server.tool()
-    async def get_order_history(ticker: str | None = None, limit: int = 20, cursor: int | None = None) -> dict[str, Any]:
-        """Filled, cancelled and rejected orders, newest first. limit is at most 50. Pass nextCursor back as cursor for the next page."""
-        page = await client.order_history(cursor, ticker, min(limit, 50))
+    async def get_order_history(ticker: str | None = None, limit: HistoryLimit = 20, cursor: int | None = None) -> dict[str, Any]:
+        """Filled, cancelled and rejected orders, newest first. limit is 1 to 50. Pass nextCursor back as cursor for the next page."""
+        page = await client.order_history(cursor, ticker, limit)
         return {"items": page["items"], "nextCursor": next_cursor(page.get("nextPagePath"))}
 
     @server.tool()
-    async def search_instruments(query: str, limit: int = 20) -> list[dict[str, Any]]:
+    async def search_instruments(query: str, limit: SearchLimit = 20) -> list[dict[str, Any]]:
         """Find tradable instruments by ticker, name, short name or ISIN (case-insensitive)."""
         needle = query.casefold()
         fields = ("ticker", "name", "shortName", "isin")
@@ -121,14 +124,14 @@ def create_server(client: T212Client, instrument_cache: Path, order_log: Path, r
         return await desk.preview("stop_limit", ticker, quantity, {"stopPrice": stop_price, "limitPrice": limit_price, "timeValidity": time_validity})
 
     @server.tool()
-    async def confirm_order(token: str, ctx: Context) -> dict[str, Any]:
+    async def confirm_order(token: str, approval: Annotated[ElicitationResult[Approval], Resolve(ask_to_place)]) -> dict[str, Any]:
         """Place a previewed order. The server asks the user to approve it first; if they decline, nothing is sent. Each token works once."""
-        return await desk.confirm(token, user_approval(ctx))
+        return await desk.confirm(token, approved(approval))
 
     @server.tool()
-    async def cancel_order(order_id: int, ctx: Context) -> str:
+    async def cancel_order(order_id: int, approval: Annotated[ElicitationResult[Approval], Resolve(ask_to_cancel)]) -> str:
         """Ask Trading 212 to cancel a pending order. The server asks the user to approve it first."""
-        return await desk.cancel(order_id, user_approval(ctx))
+        return await desk.cancel(order_id, approved(approval))
 
     return server
 

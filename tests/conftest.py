@@ -1,3 +1,4 @@
+import asyncio
 import json
 
 import pytest
@@ -33,6 +34,7 @@ def api():
 def account(api):
     api.get("metadata/instruments", name="instruments").respond(json=INSTRUMENTS)
     api.get("positions", name="positions").respond(json=POSITIONS)
+    api.get("account/summary", name="summary").respond(json={"currency": "GBP"})
     return api
 
 
@@ -57,15 +59,19 @@ def log(tmp_path):
     return read
 
 
-@pytest.fixture
-def call():
-    async def call_tool(server, tool, args=None, approve=True, questions=None, elicitation=True):
+@pytest.fixture(params=["legacy", "auto"])
+def call(request):
+    async def call_tool(server, tool, args=None, approve=True, questions=None, elicitation=True, action="accept", content=None, delay=0):
         async def answer(context, params):
             if questions is not None:
                 questions.append(params.message)
-            return types.ElicitResult(action="accept", content={"approve": approve})
-        async with Client(server, elicitation_callback=answer if elicitation else None, mode="legacy") as connection:
-            result = await connection.call_tool(tool, args or {})
+            await asyncio.sleep(delay)
+            return types.ElicitResult(action=action, content=(content or {"approve": approve}) if action == "accept" else None)
+        try:
+            async with Client(server, elicitation_callback=answer if elicitation else None, mode=request.param) as connection:
+                result = await connection.call_tool(tool, args or {})
+        except Exception as error:
+            raise ToolError(repr(error)) from error
         if result.is_error:
             raise ToolError(result.content[0].text)
         content = result.structured_content
