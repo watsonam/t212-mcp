@@ -40,7 +40,7 @@ The server enforces these rules:
 - An order request is never retried. On a timeout, a 408 or a 5xx response, the tool says the outcome is unknown, and the order counts toward the daily cap. Check `get_pending_orders` and `get_order_history` before trying again.
 - Every preview, request, response and cancellation is appended to `~/.local/state/t212-mcp/orders-<env>.jsonl`. The daily cap is read from this log.
 
-To change the caps, create `~/.config/t212-mcp/config.toml`:
+To change the caps, create `~/.config/t212-mcp/config.toml`. The server refuses to start if the file is not valid TOML, names an unknown setting, or sets a cap that is not a positive number:
 
 ```toml
 max_order_gbp = 1000
@@ -77,7 +77,7 @@ uv run keyring set t212-mcp live_api_secret
 ## Claude Code
 
 ```bash
-claude mcp add trading212 -s user --env T212_ENV=live -- uv --directory /Users/adamwatson/t212-mcp run t212-mcp
+claude mcp add trading212 -s user --env T212_ENV=live -- uv --directory /path/to/t212-mcp run t212-mcp
 ```
 
 Add `--env T212_LIVE_TRADING=1` to enable live orders.
@@ -91,7 +91,7 @@ Add this to `~/Library/Application Support/Claude/claude_desktop_config.json`:
   "mcpServers": {
     "trading212": {
       "command": "uv",
-      "args": ["--directory", "/Users/adamwatson/t212-mcp", "run", "t212-mcp"],
+      "args": ["--directory", "/path/to/t212-mcp", "run", "t212-mcp"],
       "env": {"T212_ENV": "live"}
     }
   }

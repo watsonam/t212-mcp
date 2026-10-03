@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import time
 
@@ -42,11 +43,31 @@ async def test_429_reports_reset(api, client):
         await client.pending_orders()
 
 
-async def test_spaces_calls_to_same_endpoint(api):
-    api.get("positions").respond(json=[])
+@pytest.fixture
+async def spaced_client(api):
     client = T212Client("https://demo.trading212.com", "key", "secret", min_intervals={"positions": 0.2})
-    start = time.monotonic()
-    await client.positions()
-    await client.positions()
-    assert time.monotonic() - start >= 0.2
+    yield client
     await client.aclose()
+
+
+async def test_spaces_calls_to_same_endpoint(api, spaced_client):
+    api.get("positions").respond(json=[])
+    start = time.monotonic()
+    await spaced_client.positions()
+    await spaced_client.positions()
+    assert time.monotonic() - start >= 0.2
+
+
+async def test_spaces_concurrent_calls(api, spaced_client):
+    api.get("positions").respond(json=[])
+    start = time.monotonic()
+    await asyncio.gather(spaced_client.positions(), spaced_client.positions(), spaced_client.positions())
+    assert time.monotonic() - start >= 0.4
+
+
+async def test_waits_when_rate_limit_is_used_up(api, client):
+    api.get("orders").respond(json=[], headers={"x-ratelimit-remaining": "0", "x-ratelimit-reset": str(time.time() + 0.3)})
+    start = time.monotonic()
+    await client.pending_orders()
+    await client.pending_orders()
+    assert time.monotonic() - start >= 0.25
