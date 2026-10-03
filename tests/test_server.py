@@ -5,6 +5,7 @@ import time
 import pytest
 from mcp.server.mcpserver.exceptions import ToolError
 
+from conftest import structured
 from t212_mcp.server import create_server
 
 INSTRUMENTS = [
@@ -15,11 +16,7 @@ INSTRUMENTS = [
 
 @pytest.fixture
 def server(client, tmp_path):
-    return create_server(client, tmp_path / "instruments.json")
-
-
-def structured(result):
-    return result.structured_content["result"] if "result" in result.structured_content else result.structured_content
+    return create_server(client, tmp_path / "instruments.json", tmp_path / "orders.jsonl")
 
 
 async def test_positions_add_price_in_account_currency(api, server):
@@ -48,8 +45,8 @@ async def test_search_matches_name_ticker_and_isin(api, server):
 
 async def test_instruments_are_cached_on_disk(api, client, tmp_path):
     route = api.get("metadata/instruments").respond(json=INSTRUMENTS)
-    await create_server(client, tmp_path / "instruments.json").call_tool("search_instruments", {"query": "apple"})
-    await create_server(client, tmp_path / "instruments.json").call_tool("search_instruments", {"query": "apple"})
+    await create_server(client, tmp_path / "instruments.json", tmp_path / "orders.jsonl").call_tool("search_instruments", {"query": "apple"})
+    await create_server(client, tmp_path / "instruments.json", tmp_path / "orders.jsonl").call_tool("search_instruments", {"query": "apple"})
     assert route.call_count == 1
 
 
@@ -59,7 +56,7 @@ async def test_stale_cache_is_refetched(api, client, tmp_path):
     old = time.time() - 2 * 86400
     os.utime(cache, (old, old))
     api.get("metadata/instruments").respond(json=INSTRUMENTS)
-    result = structured(await create_server(client, cache).call_tool("search_instruments", {"query": "apple"}))
+    result = structured(await create_server(client, cache, tmp_path / "orders.jsonl").call_tool("search_instruments", {"query": "apple"}))
     assert [i["ticker"] for i in result] == ["AAPL_US_EQ"]
 
 

@@ -1,13 +1,14 @@
 import json
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import parse_qs, urlparse
 
 from mcp.server.mcpserver import MCPServer
 
 from t212_mcp.client import T212Client
 from t212_mcp.config import load_settings
+from t212_mcp.orders import OrderDesk
 
 INSTRUMENT_CACHE_SECONDS = 86400
 
@@ -18,8 +19,16 @@ def next_cursor(next_page_path: str | None) -> int | None:
     return int(cursor[0])
 
 
-def create_server(client: T212Client, instrument_cache: Path) -> MCPServer:
-    server = MCPServer("trading212", instructions="Read a Trading 212 Stocks ISA. Tickers look like AAPL_US_EQ; use search_instruments to find them, never guess.")
+TimeValidity = Literal["DAY", "GOOD_TILL_CANCEL"]
+INSTRUCTIONS = (
+    "Trading 212 Stocks ISA. Tickers look like AAPL_US_EQ; find them with search_instruments, never guess. "
+    "Orders are by share quantity: positive buys, negative sells. Every preview_* tool returns a preview and a token. "
+    "Show the preview to the user and call confirm_order only after they approve it. Never confirm an order twice or resend one after an error."
+)
+
+
+def create_server(client: T212Client, instrument_cache: Path, order_log: Path, trading_enabled: bool = False, max_order_gbp: float = 1000, max_daily_gbp: float = 2000, token_seconds: float = 300) -> MCPServer:
+    server = MCPServer("trading212", instructions=INSTRUCTIONS)
 
     async def instruments() -> list[dict]:
         if instrument_cache.exists() and time.time() - instrument_cache.stat().st_mtime < INSTRUMENT_CACHE_SECONDS:
@@ -61,10 +70,48 @@ def create_server(client: T212Client, instrument_cache: Path) -> MCPServer:
         fields = ("ticker", "name", "shortName", "isin")
         return [i for i in await instruments() if any(needle in str(i.get(f, "")).casefold() for f in fields)][:limit]
 
+    desk = OrderDesk(client, instruments, order_log, trading_enabled, max_order_gbp, max_daily_gbp, token_seconds)
+
+    @server.tool()
+    async def get_order(order_id: int) -> dict[str, Any]:
+        """Status of one pending order."""
+        return await client.order(order_id)
+
+    @server.tool()
+    async def preview_market_order(ticker: str, quantity: float, extended_hours: bool = False) -> dict[str, Any]:
+        """Preview a market order. Buys are only allowed for instruments already held, since there is no price quote. Returns a token for confirm_order."""
+        return await desk.preview("market", ticker, quantity, extended_hours=extended_hours)
+
+    @server.tool()
+    async def preview_limit_order(ticker: str, quantity: float, limit_price: float, time_validity: TimeValidity = "DAY") -> dict[str, Any]:
+        """Preview a limit order. limit_price is in the instrument's own currency (pence for GBX). Returns a token for confirm_order."""
+        return await desk.preview("limit", ticker, quantity, limit_price=limit_price, time_validity=time_validity)
+
+    @server.tool()
+    async def preview_stop_order(ticker: str, quantity: float, stop_price: float, time_validity: TimeValidity = "DAY") -> dict[str, Any]:
+        """Preview a stop order (a market order once the last traded price reaches stop_price). Sells only. Returns a token for confirm_order."""
+        return await desk.preview("stop", ticker, quantity, stop_price=stop_price, time_validity=time_validity)
+
+    @server.tool()
+    async def preview_stop_limit_order(ticker: str, quantity: float, stop_price: float, limit_price: float, time_validity: TimeValidity = "DAY") -> dict[str, Any]:
+        """Preview a stop-limit order (a limit order at limit_price once the last traded price reaches stop_price). Returns a token for confirm_order."""
+        return await desk.preview("stop_limit", ticker, quantity, limit_price=limit_price, stop_price=stop_price, time_validity=time_validity)
+
+    @server.tool()
+    async def confirm_order(token: str) -> dict[str, Any]:
+        """Place a previewed order. Only call this after the user approves the preview. Each token works once."""
+        return await desk.confirm(token)
+
+    @server.tool()
+    async def cancel_order(order_id: int) -> str:
+        """Ask Trading 212 to cancel a pending order."""
+        return await desk.cancel(order_id)
+
     return server
 
 
 def main() -> None:
     settings = load_settings()
     client = T212Client(settings.base_url, settings.api_key, settings.api_secret)
-    create_server(client, settings.cache_dir / f"instruments-{settings.env}.json").run()
+    instrument_cache = settings.cache_dir / f"instruments-{settings.env}.json"
+    create_server(client, instrument_cache, settings.log_path, settings.trading_enabled, settings.max_order_gbp, settings.max_daily_gbp).run()

@@ -17,3 +17,8 @@ async def client(api):
     client = T212Client("https://demo.trading212.com", "key", "secret", min_intervals={})
     yield client
     await client.aclose()
+
+
+def structured(result):
+    content = result.structured_content
+    return content["result"] if set(content) == {"result"} else content

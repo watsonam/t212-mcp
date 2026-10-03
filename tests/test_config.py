@@ -31,3 +31,25 @@ def test_missing_secret_names_the_variable():
 def test_rejects_unknown_env():
     with pytest.raises(ConfigError, match="T212_ENV"):
         load_settings({"T212_ENV": "prod"}, keychain=no_keychain)
+
+
+def test_live_trading_is_off_by_default():
+    settings = load_settings({"T212_ENV": "live", "T212_LIVE_API_KEY": "k", "T212_LIVE_API_SECRET": "s"}, keychain=no_keychain)
+    assert settings.trading_enabled is False
+    assert (settings.max_order_gbp, settings.max_daily_gbp) == (1000, 2000)
+
+
+def test_live_trading_switch():
+    settings = load_settings({"T212_ENV": "live", "T212_LIVE_TRADING": "1", "T212_LIVE_API_KEY": "k", "T212_LIVE_API_SECRET": "s"}, keychain=no_keychain)
+    assert settings.trading_enabled is True
+
+
+def test_demo_always_trades():
+    assert load_settings({"T212_DEMO_API_KEY": "k", "T212_DEMO_API_SECRET": "s"}, keychain=no_keychain).trading_enabled is True
+
+
+def test_caps_from_config_file(tmp_path):
+    config = tmp_path / "config.toml"
+    config.write_text("max_order_gbp = 250\nmax_daily_gbp = 500\n")
+    settings = load_settings({"T212_CONFIG": str(config), "T212_DEMO_API_KEY": "k", "T212_DEMO_API_SECRET": "s"}, keychain=no_keychain)
+    assert (settings.max_order_gbp, settings.max_daily_gbp) == (250, 500)
