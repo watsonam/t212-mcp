@@ -4,7 +4,10 @@ from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import parse_qs, urlparse
 
-from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver import Context, MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
+from mcp.shared.exceptions import MCPError
+from pydantic import BaseModel
 
 from t212_mcp.client import T212Client
 from t212_mcp.config import load_settings
@@ -23,8 +26,23 @@ TimeValidity = Literal["DAY", "GOOD_TILL_CANCEL"]
 INSTRUCTIONS = (
     "Trading 212 Stocks ISA. Tickers look like AAPL_US_EQ; find them with search_instruments, never guess. "
     "Orders are by share quantity: positive buys, negative sells. Every preview_* tool returns a preview and a token. "
-    "Show the preview to the user and call confirm_order only after they approve it. Never confirm an order twice or resend one after an error."
+    "Show the preview to the user, then call confirm_order; the server asks the user to approve every order and cancellation itself. "
+    "Never confirm an order twice or resend one after an error."
 )
+
+
+class Approval(BaseModel):
+    approve: bool
+
+
+def user_approval(ctx: Context):
+    async def approve(question: str) -> bool:
+        try:
+            answer = await ctx.elicit(question, Approval)
+        except MCPError as error:
+            raise ToolError(f"Could not ask the user to approve, so nothing was sent ({error}). The MCP client must support elicitation.") from error
+        return answer.action == "accept" and answer.data.approve
+    return approve
 
 
 def create_server(client: T212Client, instrument_cache: Path, order_log: Path, trading_enabled: bool = False, max_order_gbp: float = 1000, max_daily_gbp: float = 2000, token_seconds: float = 300) -> MCPServer:
@@ -98,14 +116,14 @@ def create_server(client: T212Client, instrument_cache: Path, order_log: Path, t
         return await desk.preview("stop_limit", ticker, quantity, limit_price=limit_price, stop_price=stop_price, time_validity=time_validity)
 
     @server.tool()
-    async def confirm_order(token: str) -> dict[str, Any]:
-        """Place a previewed order. Only call this after the user approves the preview. Each token works once."""
-        return await desk.confirm(token)
+    async def confirm_order(token: str, ctx: Context) -> dict[str, Any]:
+        """Place a previewed order. The server asks the user to approve it first; if they decline, nothing is sent. Each token works once."""
+        return await desk.confirm(token, user_approval(ctx))
 
     @server.tool()
-    async def cancel_order(order_id: int) -> str:
-        """Ask Trading 212 to cancel a pending order."""
-        return await desk.cancel(order_id)
+    async def cancel_order(order_id: int, ctx: Context) -> str:
+        """Ask Trading 212 to cancel a pending order. The server asks the user to approve it first."""
+        return await desk.cancel(order_id, user_approval(ctx))
 
     return server
 

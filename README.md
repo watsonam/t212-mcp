@@ -25,7 +25,9 @@ The instrument list is cached for 24 hours in `~/.cache/t212-mcp/instruments-<en
 
 ## Orders
 
-Placing an order takes two calls. A `preview_*` tool checks the order and returns the ticker, name, side, quantity, estimated GBP value and a token. `confirm_order` with that token places it. A token works once and expires after 5 minutes.
+Placing an order takes two calls. A `preview_*` tool checks the order and returns the ticker, name, side, quantity, estimated GBP value and a token. `confirm_order` with that token asks you to approve the order, then places it. A token works once and expires after 5 minutes.
+
+The approval question comes from the server through MCP elicitation, so Claude cannot answer it for you. `cancel_order` asks the same way. If you decline, nothing is sent. If the MCP client cannot show the question, the order is refused.
 
 The server enforces these rules:
 

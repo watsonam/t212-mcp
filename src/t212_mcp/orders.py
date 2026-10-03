@@ -13,7 +13,11 @@ from t212_mcp.client import T212Client, T212NoAnswer
 
 FIXED_RATES = {"GBP": 1.0, "GBX": 0.01}
 DISABLED = "Live trading is off. Set T212_LIVE_TRADING=1 in the server's environment to enable order tools."
+DECLINED = "Not approved, so nothing was sent. Preview the order again to retry."
 NO_ANSWER = "No answer from Trading 212, so the order may or may not have been placed. Do not resend it. Check get_pending_orders and get_order_history first."
+
+
+Approve = Callable[[str], Awaitable[bool]]
 
 
 @dataclass(frozen=True)
@@ -22,6 +26,7 @@ class PendingOrder:
     body: dict
     value_gbp: float
     expires: float
+    summary: str
 
 
 class OrderDesk:
@@ -76,8 +81,11 @@ class OrderDesk:
         body |= {"extendedHours": extended_hours} if kind == "market" else {"stopPrice": stop_price, "limitPrice": limit_price, "timeValidity": time_validity}
         body = {k: v for k, v in body.items() if v is not None}
         token = secrets.token_urlsafe(8)
-        self._pending[token] = PendingOrder(kind, body, value, time.monotonic() + self._token_seconds)
-        preview = {"token": token, "type": kind, "name": instrument["name"], "side": "BUY" if quantity > 0 else "SELL", **body, "estimatedValueGbp": round(value, 2), "spentTodayGbp": round(spent, 2), "expiresInSeconds": self._token_seconds}
+        side = "BUY" if quantity > 0 else "SELL"
+        prices = ", ".join(f"{label} {body[key]}" for key, label in (("limitPrice", "limit"), ("stopPrice", "stop")) if key in body)
+        summary = f"{side} {abs(quantity):g} x {instrument['name']} ({ticker}), {kind.replace('_', '-')} order{', ' + prices if prices else ''}, about £{value:,.2f}. Place this order?"
+        self._pending[token] = PendingOrder(kind, body, value, time.monotonic() + self._token_seconds, summary)
+        preview = {"token": token, "type": kind, "name": instrument["name"], "side": side, **body, "estimatedValueGbp": round(value, 2), "spentTodayGbp": round(spent, 2), "expiresInSeconds": self._token_seconds}
         self._log("preview", **preview)
         return preview
 
@@ -99,11 +107,17 @@ class OrderDesk:
                 return p["walletImpact"]["currentValue"] / (p["quantity"] * p["currentPrice"])
         raise ToolError(f"No GBP rate for {currency}: no held position is priced in it, so the cost cannot be capped")
 
-    async def confirm(self, token: str) -> dict:
+    async def confirm(self, token: str, approve: Approve) -> dict:
         self._require_enabled()
         pending = self._pending.pop(token, None)
         if pending is None or pending.expires <= time.monotonic():
             raise ToolError("Unknown, used or expired token; preview the order again")
+        self._check_caps(pending.value_gbp)
+        if not await approve(pending.summary):
+            self._log("declined", token=token)
+            raise ToolError(DECLINED)
+        if pending.expires <= time.monotonic():
+            raise ToolError("The token expired while waiting for approval; preview the order again")
         self._check_caps(pending.value_gbp)
         self._log("sent", token=token, kind=pending.kind, body=pending.body, valueGbp=pending.value_gbp)
         try:
@@ -117,8 +131,11 @@ class OrderDesk:
         self._log("placed", token=token, response=order)
         return order
 
-    async def cancel(self, order_id: int) -> str:
+    async def cancel(self, order_id: int, approve: Approve) -> str:
         self._require_enabled()
+        if not await approve(f"Cancel pending order {order_id}?"):
+            self._log("declined", orderId=order_id)
+            raise ToolError("Not approved, so the order was not cancelled.")
         self._log("cancel", orderId=order_id)
         await self._client.cancel_order(order_id)
         return f"Cancellation of order {order_id} accepted; it may still fill if it was already filling. Check with get_order."
