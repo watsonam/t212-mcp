@@ -89,3 +89,34 @@ async def test_api_errors_become_tool_errors(api, server, call):
     api.get("account/summary").respond(403)
     with pytest.raises(ToolError, match="account"):
         await call(server, "get_account_summary")
+
+
+async def test_dividends_return_next_cursor(api, server, call):
+    route = api.get("history/dividends").respond(json={"items": [{"ticker": "VUSAl_EQ", "amount": 1.23}], "nextPagePath": "/api/v0/equity/history/dividends?limit=20&cursor=777"})
+    page = await call(server, "get_dividends", {"ticker": "VUSAl_EQ", "limit": 20})
+    assert page == {"items": [{"ticker": "VUSAl_EQ", "amount": 1.23}], "nextCursor": 777}
+    assert dict(route.calls.last.request.url.params) == {"ticker": "VUSAl_EQ", "limit": "20"}
+
+
+async def test_transactions_pass_time_and_text_cursor(api, server, call):
+    route = api.get("history/transactions").respond(json={"items": [{"type": "DEPOSIT", "amount": 100}], "nextPagePath": "/api/v0/equity/history/transactions?limit=50&cursor=abc123"})
+    page = await call(server, "get_transactions", {"since": "2026-10-01T00:00:00Z", "cursor": "xyz", "limit": 50})
+    assert page == {"items": [{"type": "DEPOSIT", "amount": 100}], "nextCursor": "abc123"}
+    assert dict(route.calls.last.request.url.params) == {"time": "2026-10-01T00:00:00Z", "cursor": "xyz", "limit": "50"}
+
+
+@pytest.mark.parametrize(("path", "tool", "scope"), [("history/dividends", "get_dividends", "history:dividends"), ("history/transactions", "get_transactions", "history:transactions")])
+async def test_history_403_names_its_scope(api, server, call, path, tool, scope):
+    api.get(path).respond(403)
+    with pytest.raises(ToolError, match=scope):
+        await call(server, tool)
+
+
+async def test_tools_tell_the_app_what_they_change(server):
+    tools = await server.list_tools()
+    hints = {t.name: t.annotations for t in tools}
+    reads = ["get_account_summary", "get_positions", "get_pending_orders", "get_order", "get_order_history", "get_dividends", "get_transactions", "search_instruments", "preview_market_order", "preview_limit_order", "preview_stop_order", "preview_stop_limit_order"]
+    assert all(hints[name].read_only_hint is True for name in reads)
+    assert (hints["confirm_order"].read_only_hint, hints["confirm_order"].destructive_hint, hints["confirm_order"].idempotent_hint) == (False, True, False)
+    assert (hints["cancel_order"].read_only_hint, hints["cancel_order"].destructive_hint) == (False, True)
+    assert all(t.title for t in tools)

@@ -8,7 +8,7 @@ import httpx
 from mcp.server.mcpserver.exceptions import ToolError
 
 MIN_INTERVALS = {
-    "account/summary": 5, "positions": 1, "orders": 5, "orders/id": 1, "orders/cancel": 1.2, "history/orders": 3,
+    "account/summary": 5, "positions": 1, "orders": 5, "orders/id": 1, "orders/cancel": 1.2, "history/orders": 3, "history/dividends": 3, "history/transactions": 3,
     "metadata/instruments": 50, "orders/market": 1.2, "orders/limit": 2, "orders/stop": 2, "orders/stop_limit": 2,
 }
 MAX_RATE_LIMIT_WAIT = 60
@@ -90,6 +90,12 @@ class T212Client:
 
     async def order_history(self, cursor: int | None = None, ticker: str | None = None, limit: int | None = None) -> dict[str, Any]:
         return await self._request("GET", "history/orders", "history:orders", cursor=cursor, ticker=ticker, limit=limit)
+
+    async def dividends(self, cursor: int | None = None, ticker: str | None = None, limit: int | None = None) -> dict[str, Any]:
+        return await self._request("GET", "history/dividends", "history:dividends", cursor=cursor, ticker=ticker, limit=limit)
+
+    async def transactions(self, cursor: str | None = None, time: str | None = None, limit: int | None = None) -> dict[str, Any]:
+        return await self._request("GET", "history/transactions", "history:transactions", cursor=cursor, time=time, limit=limit)
 
     async def instruments(self) -> list[dict[str, Any]]:
         return await self._request("GET", "metadata/instruments", "metadata")
