@@ -16,7 +16,9 @@ from mcp.server.mcpserver.exceptions import ToolError
 from t212_mcp.client import T212Client, T212Error, T212NoAnswer
 from t212_mcp.config import TradingRules
 
-if sys.platform != "win32":
+if sys.platform == "win32":
+    import msvcrt
+else:
     import fcntl
 
 OrderKind = Literal["market", "limit", "stop", "stop_limit"]
@@ -27,6 +29,31 @@ DISABLED = "Live trading is off. Set T212_LIVE_TRADING=1 in the server's environ
 DECLINED = "Not approved, so nothing was sent. Preview the order again to retry."
 NO_ANSWER = "No usable answer from Trading 212, so the order may or may not have been placed. Do not resend it. Check get_pending_orders and get_order_history first."
 CANCEL_NO_ANSWER = "No usable answer from Trading 212, so the order may or may not have been cancelled. Check get_order or get_pending_orders."
+
+
+LOCK_POLL_SECONDS = 0.05
+
+
+@contextmanager
+def hold_file_lock(path: Path) -> Iterator[None]:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.touch()
+    with path.open("r+b") as lock:
+        if sys.platform == "win32":
+            while True:
+                try:
+                    msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError:
+                    time.sleep(LOCK_POLL_SECONDS)
+            try:
+                yield
+            finally:
+                lock.seek(0)
+                msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            yield
 
 
 def position_price_gbp(position: dict[str, Any]) -> float:
@@ -68,16 +95,6 @@ class OrderDesk:
             if sync:
                 log.flush()
                 os.fsync(log.fileno())
-
-    @contextmanager
-    def _log_lock(self) -> Iterator[None]:
-        if sys.platform == "win32":
-            yield
-            return
-        self._log_path.parent.mkdir(parents=True, exist_ok=True)
-        with self._log_path.with_suffix(".lock").open("a") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
-            yield
 
     def _log_entries(self) -> Iterator[dict[str, Any]]:
         if not self._log_path.exists():
@@ -193,7 +210,7 @@ class OrderDesk:
         if not approved:
             self._log("declined", token=token)
             raise ToolError(DECLINED)
-        with self._log_lock():
+        with hold_file_lock(self._log_path.with_suffix(".lock")):
             self._check_caps(pending.value_gbp)
             self._log("sent", sync=True, token=token, kind=pending.kind, body=pending.body, valueGbp=pending.value_gbp)
         try:

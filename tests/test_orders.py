@@ -311,12 +311,11 @@ async def test_concurrent_confirms_respect_the_daily_cap(account, make_server, p
     assert sum(isinstance(r, ToolError) for r in results) == 1
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="the order log lock uses fcntl")
 async def test_confirm_waits_for_another_process_holding_the_log_lock(account, make_server, preview, call, tmp_path):
     account.post("orders/market").respond(json={"id": 1})
     server = make_server()
     token = (await preview(server, "preview_market_order", ticker="VUSAl_EQ", quantity=2))["token"]
-    script = f"import fcntl, time; f = open({str(tmp_path / 'orders.lock')!r}, 'a'); fcntl.flock(f, fcntl.LOCK_EX); print('locked', flush=True); time.sleep(0.6)"
+    script = f"import time; from pathlib import Path; from t212_mcp.orders import hold_file_lock\nwith hold_file_lock(Path({str(tmp_path / 'orders.lock')!r})):\n    print('locked', flush=True)\n    time.sleep(0.6)"
     holder = subprocess.Popen([sys.executable, "-c", script], stdout=subprocess.PIPE, text=True)
     assert holder.stdout.readline().strip() == "locked"
     start = time.monotonic()
