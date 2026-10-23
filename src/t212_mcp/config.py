@@ -2,7 +2,7 @@ import math
 import os
 import tomllib
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Literal, cast, get_args
 
@@ -28,8 +28,8 @@ CAP_NAMES = {f.name for f in fields(TradingRules)} - {"enabled"}
 @dataclass(frozen=True)
 class Settings:
     env: Environment
-    api_key: str
-    api_secret: str
+    api_key: str = field(repr=False)
+    api_secret: str = field(repr=False)
     cache_dir: Path
     log_path: Path
     rules: TradingRules

@@ -1,6 +1,8 @@
 import asyncio
 import json
 import os
+import secrets
+import stat
 import time
 from pathlib import Path
 from typing import Annotated, Any, Literal
@@ -11,7 +13,7 @@ from pydantic import BaseModel, Field
 
 from t212_mcp.client import T212Client
 from t212_mcp.config import Settings, TradingRules, load_settings
-from t212_mcp.orders import OrderDesk, position_price_gbp
+from t212_mcp.orders import OrderDesk, open_private, owned_by_me, position_price_gbp
 
 INSTRUMENT_CACHE_SECONDS = 86400
 TimeValidity = Literal["DAY", "GOOD_TILL_CANCEL"]
@@ -44,15 +46,16 @@ def create_server(client: T212Client, instrument_cache: Path, order_log: Path, r
 
     async def instruments() -> list[dict[str, Any]]:
         try:
-            if time.time() - instrument_cache.stat().st_mtime < INSTRUMENT_CACHE_SECONDS:
+            info = instrument_cache.lstat()
+            if stat.S_ISREG(info.st_mode) and owned_by_me(info) and time.time() - info.st_mtime < INSTRUMENT_CACHE_SECONDS:
                 return json.loads(instrument_cache.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             pass
         items = await client.instruments()
-        instrument_cache.parent.mkdir(parents=True, exist_ok=True)
-        partial = instrument_cache.with_suffix(f".{os.getpid()}.tmp")
+        partial = instrument_cache.with_name(f"{instrument_cache.name}.{secrets.token_hex(8)}.tmp")
         try:
-            partial.write_text(json.dumps(items), encoding="utf-8")
+            with open_private(partial, os.O_WRONLY | os.O_EXCL, "wb") as file:
+                file.write(json.dumps(items).encode("utf-8"))
             partial.replace(instrument_cache)
         except OSError:
             pass
@@ -65,8 +68,8 @@ def create_server(client: T212Client, instrument_cache: Path, order_log: Path, r
     def ask_to_place(token: str) -> Elicit[Approval]:
         return Elicit(desk.question(token), Approval)
 
-    def ask_to_cancel(order_id: int) -> Elicit[Approval]:
-        return Elicit(desk.cancel_question(order_id), Approval)
+    async def ask_to_cancel(order_id: int) -> Elicit[Approval]:
+        return Elicit(await desk.cancel_question(order_id), Approval)
 
     @server.tool()
     async def get_account_summary() -> dict[str, Any]:

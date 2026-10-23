@@ -1,3 +1,4 @@
+import asyncio
 import errno
 import json
 import math
@@ -5,8 +6,9 @@ import os
 import secrets
 import sys
 import time
-from collections.abc import Awaitable, Callable, Iterator
-from contextlib import contextmanager
+import unicodedata
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -34,6 +36,36 @@ CANCEL_NO_ANSWER = "No usable answer from Trading 212, so the order may or may n
 
 LOCK_POLL_SECONDS = 0.05
 LOCK_TIMEOUT_SECONDS = 10.0
+
+
+PRIVATE_OPEN_FLAGS = getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+DISPLAY_TEXT_LIMIT = 80
+
+
+def owned_by_me(info: os.stat_result) -> bool:
+    return sys.platform == "win32" or info.st_uid == os.getuid()
+
+
+def open_private(path: Path, flags: int, mode: str) -> BinaryIO:
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd = os.open(path, flags | os.O_CREAT | PRIVATE_OPEN_FLAGS, 0o600)
+    try:
+        if sys.platform != "win32":
+            if not owned_by_me(os.fstat(fd)):
+                raise PermissionError(f"{path} belongs to another user")
+            os.fchmod(fd, 0o600)
+        return os.fdopen(fd, mode)
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def exact(number: float) -> str:
+    return f"{number:.15g}"
+
+
+def display_text(text: Any) -> str:
+    return "".join(c for c in str(text) if not unicodedata.category(c).startswith("C"))[:DISPLAY_TEXT_LIMIT]
 
 
 LOCK_BUSY_ERRNOS = {errno.EACCES, errno.EDEADLK} if sys.platform == "win32" else {errno.EAGAIN, errno.EWOULDBLOCK}
@@ -64,12 +96,10 @@ def unlock(lock: BinaryIO) -> None:
         pass
 
 
-@contextmanager
-def hold_file_lock(path: Path) -> Iterator[None]:
+@asynccontextmanager
+async def hold_file_lock(path: Path) -> AsyncIterator[None]:
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.touch()
-        lock = path.open("r+b")
+        lock = open_private(path, os.O_RDWR, "r+b")
     except OSError as error:
         raise ToolError(f"Could not open the order log lock {path}, so nothing was sent: {error}") from error
     with lock:
@@ -78,7 +108,7 @@ def hold_file_lock(path: Path) -> Iterator[None]:
             while not try_lock(lock):
                 if time.monotonic() > deadline:
                     raise ToolError(f"The order log lock {path} stayed busy for {LOCK_TIMEOUT_SECONDS:g}s, so nothing was sent")
-                time.sleep(LOCK_POLL_SECONDS)
+                await asyncio.sleep(LOCK_POLL_SECONDS)
         except OSError as error:
             raise ToolError(f"Could not lock the order log {path}, so nothing was sent: {error}") from error
         try:
@@ -117,8 +147,7 @@ class OrderDesk:
     def _log(self, event: str, sync: bool = False, **fields: Any) -> None:
         line = json.dumps({"time": datetime.now().astimezone().isoformat(), "event": event, **fields}) + "\n"
         try:
-            self._log_path.parent.mkdir(parents=True, exist_ok=True)
-            with self._log_path.open("a+b") as log:
+            with open_private(self._log_path, os.O_RDWR | os.O_APPEND, "a+b") as log:
                 if log.seek(0, os.SEEK_END):
                     log.seek(-1, os.SEEK_END)
                     if log.read(1) != b"\n":
@@ -192,10 +221,10 @@ class OrderDesk:
         body = {"ticker": ticker, "quantity": quantity, **terms}
         side = "BUY" if quantity > 0 else "SELL"
         currency = "pence" if instrument["currencyCode"] == "GBX" else instrument["currencyCode"]
-        details = [f"{label} {terms[key]:g} {currency}" for key, label in (("limitPrice", "limit"), ("stopPrice", "stop")) if key in terms]
+        details = [f"{label} {exact(terms[key])} {currency}" for key, label in (("limitPrice", "limit"), ("stopPrice", "stop")) if key in terms]
         details += [{"DAY": "day only", "GOOD_TILL_CANCEL": "good till cancelled"}[terms["timeValidity"]]] if "timeValidity" in terms else []
         details += ["extended hours"] if terms.get("extendedHours") else []
-        summary = f"{side} {abs(quantity):g} x {instrument['name']} ({ticker}), {kind.replace('_', '-')} order{''.join(', ' + d for d in details)}, about £{value:,.2f}. Place this order?"
+        summary = f"{side} {exact(abs(quantity))} x {display_text(instrument['name'])} ({display_text(ticker)}), {kind.replace('_', '-')} order{''.join(', ' + d for d in details)}, about £{value:,.2f}. Place this order?"
         now = time.monotonic()
         self._pending = {t: p for t, p in self._pending.items() if p.expires > now}
         token = secrets.token_urlsafe(8)
@@ -237,9 +266,18 @@ class OrderDesk:
         self._check_caps(pending.value_gbp)
         return pending.summary
 
-    def cancel_question(self, order_id: int) -> str:
+    async def cancel_question(self, order_id: int) -> str:
         self._require_enabled()
-        return f"Cancel pending order {order_id}?"
+        try:
+            order = await self._client.order(order_id)
+        except T212Error as error:
+            raise ToolError(f"Could not look up order {order_id}, so nothing was cancelled: {error}") from error
+        quantity = order.get("quantity") or 0
+        side = order.get("side") or ("SELL" if quantity < 0 else "BUY")
+        name = display_text((order.get("instrument") or {}).get("name") or order.get("ticker", ""))
+        prices = "".join(f", {label} {exact(order[key])}" for key, label in (("limitPrice", "limit"), ("stopPrice", "stop")) if isinstance(order.get(key), int | float))
+        kind = display_text(str(order.get("type", "")).lower().replace("_", "-"))
+        return f"Cancel order {order_id}: {side} {exact(abs(quantity))} x {name} ({display_text(order.get('ticker', ''))}), {kind} order{prices}?"
 
     async def confirm(self, token: str, approved: bool) -> dict[str, Any]:
         self._require_enabled()
@@ -248,7 +286,7 @@ class OrderDesk:
         if not approved:
             self._log("declined", token=token)
             raise ToolError(DECLINED)
-        with hold_file_lock(self._log_path.with_suffix(".lock")):
+        async with hold_file_lock(self._log_path.with_suffix(".lock")):
             self._check_caps(pending.value_gbp)
             self._log("sent", sync=True, token=token, kind=pending.kind, body=pending.body, valueGbp=pending.value_gbp)
         try:

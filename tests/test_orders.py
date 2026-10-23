@@ -1,6 +1,7 @@
 import asyncio
 import errno
 import json
+import os
 import subprocess
 import sys
 import time
@@ -11,7 +12,7 @@ import httpx
 import pytest
 from mcp.server.mcpserver.exceptions import ToolError
 
-from conftest import INSTRUMENTS
+from conftest import INSTRUMENTS, POSITIONS
 from t212_mcp.config import TradingRules
 from t212_mcp.orders import OrderDesk, hold_file_lock
 from t212_mcp.server import create_server
@@ -188,6 +189,7 @@ async def test_client_without_elicitation_cannot_place_orders(account, make_serv
 
 
 async def test_declined_cancel_is_not_sent(api, make_server, call):
+    pending_order(api)
     cancel = api.delete("orders/42").respond(200)
     with pytest.raises(ToolError, match="not cancelled"):
         await call(make_server(), "cancel_order", {"order_id": 42}, approve=False)
@@ -259,11 +261,23 @@ async def test_rejection_logs_the_response_body(account, make_server, preview, c
 
 
 async def test_failed_cancel_is_logged(api, make_server, call, log):
+    pending_order(api)
     api.delete("orders/42").respond(404, text="Order not found")
     with pytest.raises(ToolError, match="404"):
         await call(make_server(), "cancel_order", {"order_id": 42})
     assert (log()[-1]["event"], log()[-1]["response"]) == ("cancel-failed", "Order not found")
 
+
+
+PENDING_ORDER = {"id": 42, "ticker": "VUSAl_EQ", "instrument": {"name": "Vanguard S&P 500"}, "side": "SELL", "quantity": -3, "type": "STOP", "stopPrice": 8500, "status": "NEW"}
+
+
+def pending_order(api, order=PENDING_ORDER):
+    return api.get("orders/42").respond(json=order)
+
+
+def hold_lock_script(path, seconds):
+    return f"import asyncio, time\nfrom pathlib import Path\nfrom t212_mcp.orders import hold_file_lock\nasync def main():\n    async with hold_file_lock(Path({str(path)!r})):\n        print('locked', flush=True)\n        time.sleep({seconds})\nasyncio.run(main())"
 
 
 def write_log(tmp_path, *entries):
@@ -318,7 +332,7 @@ async def test_confirm_waits_for_another_process_holding_the_log_lock(account, m
     account.post("orders/market").respond(json={"id": 1})
     server = make_server()
     token = (await preview(server, "preview_market_order", ticker="VUSAl_EQ", quantity=2))["token"]
-    script = f"import time; from pathlib import Path; from t212_mcp.orders import hold_file_lock\nwith hold_file_lock(Path({str(tmp_path / 'orders.lock')!r})):\n    print('locked', flush=True)\n    time.sleep(0.6)"
+    script = hold_lock_script(tmp_path / "orders.lock", 0.6)
     holder = subprocess.Popen([sys.executable, "-c", script], stdout=subprocess.PIPE, text=True)
     try:
         assert holder.stdout.readline().strip() == "locked"
@@ -335,7 +349,7 @@ async def test_busy_lock_times_out_without_sending(account, make_server, preview
     monkeypatch.setattr("t212_mcp.orders.LOCK_TIMEOUT_SECONDS", 0.2)
     server = make_server()
     token = (await preview(server, "preview_market_order", ticker="VUSAl_EQ", quantity=2))["token"]
-    script = f"import time; from pathlib import Path; from t212_mcp.orders import hold_file_lock\nwith hold_file_lock(Path({str(tmp_path / 'orders.lock')!r})):\n    print('locked', flush=True)\n    time.sleep(3)"
+    script = hold_lock_script(tmp_path / "orders.lock", 3)
     holder = subprocess.Popen([sys.executable, "-c", script], stdout=subprocess.PIPE, text=True)
     try:
         assert holder.stdout.readline().strip() == "locked"
@@ -357,21 +371,22 @@ async def test_unwritable_order_log_is_a_clear_error(account, client, tmp_path, 
 
 async def test_failed_log_write_is_a_clear_error(account, make_server, preview, tmp_path, monkeypatch):
     log_path = tmp_path / "orders.jsonl"
-    original = Path.open
-    def open_(self, mode="r", *args, **kwargs):
-        if self == log_path and "a" in mode:
+    original = os.open
+    def open_(path, *args, **kwargs):
+        if Path(path) == log_path:
             raise PermissionError("in use")
-        return original(self, mode, *args, **kwargs)
-    monkeypatch.setattr(Path, "open", open_)
+        return original(path, *args, **kwargs)
+    monkeypatch.setattr("t212_mcp.orders.os.open", open_)
     with pytest.raises(ToolError, match="Could not write the order log"):
         await preview(make_server(), "preview_market_order", ticker="VUSAl_EQ", quantity=2)
 
 
-def test_unopenable_lock_is_a_clear_error(tmp_path):
+async def test_unopenable_lock_is_a_clear_error(tmp_path):
     blocker = tmp_path / "not-a-folder"
     blocker.write_text("", encoding="utf-8")
-    with pytest.raises(ToolError, match="nothing was sent"), hold_file_lock(blocker / "orders.lock"):
-        pass
+    with pytest.raises(ToolError, match="nothing was sent"):
+        async with hold_file_lock(blocker / "orders.lock"):
+            pass
 
 
 async def test_tiny_holding_is_refused(api, make_server, preview):
@@ -440,6 +455,7 @@ async def test_empty_success_body_is_reported_as_placed(account, make_server, pr
 
 
 async def test_cancel_with_no_answer_says_outcome_unknown(api, make_server, call, log):
+    pending_order(api)
     api.delete("orders/42").mock(side_effect=httpx.ReadTimeout("slow"))
     with pytest.raises(ToolError, match="may or may not have been cancelled"):
         await call(make_server(), "cancel_order", {"order_id": 42})
@@ -514,17 +530,19 @@ async def test_rejection_is_reported_even_if_logging_fails(account, make_server,
 
 
 async def test_cancel_is_reported_even_if_logging_fails(api, make_server, call, monkeypatch):
+    pending_order(api)
     api.delete("orders/42").respond(200)
     fail_logging_for(monkeypatch, "cancelled")
     assert "accepted" in await call(make_server(), "cancel_order", {"order_id": 42})
 
 
-def test_lock_error_other_than_busy_is_a_clear_error(tmp_path, monkeypatch):
+async def test_lock_error_other_than_busy_is_a_clear_error(tmp_path, monkeypatch):
     def broken(*args):
         raise OSError(errno.ENOLCK, "No locks available")
     monkeypatch.setattr("t212_mcp.orders.msvcrt.locking" if sys.platform == "win32" else "t212_mcp.orders.fcntl.flock", broken)
-    with pytest.raises(ToolError, match="Could not lock"), hold_file_lock(tmp_path / "orders.lock"):
-        pass
+    with pytest.raises(ToolError, match="Could not lock"):
+        async with hold_file_lock(tmp_path / "orders.lock"):
+            pass
 
 
 async def test_unreadable_order_log_is_a_clear_error(account, make_server, preview, tmp_path, monkeypatch):
@@ -538,3 +556,86 @@ async def test_unreadable_order_log_is_a_clear_error(account, make_server, previ
     monkeypatch.setattr(Path, "read_text", read_text)
     with pytest.raises(ToolError, match="Could not read the order log"):
         await preview(make_server(), "preview_market_order", ticker="VUSAl_EQ", quantity=2)
+
+
+async def test_cancel_question_describes_the_order(api, make_server, call):
+    pending_order(api)
+    api.delete("orders/42").respond(200)
+    questions = []
+    await call(make_server(), "cancel_order", {"order_id": 42}, questions=questions)
+    assert questions[-1] == "Cancel order 42: SELL 3 x Vanguard S&P 500 (VUSAl_EQ), stop order, stop 8500?"
+
+
+async def test_cancel_of_unknown_order_is_refused(api, make_server, call):
+    api.get("orders/42").respond(404, text="Order not found")
+    cancel = api.delete("orders/42").respond(200)
+    with pytest.raises(ToolError, match="Could not look up order 42"):
+        await call(make_server(), "cancel_order", {"order_id": 42})
+    assert cancel.call_count == 0
+
+
+async def test_question_shows_numbers_exactly(account, make_server, preview, call):
+    account.post("orders/limit").respond(json={"id": 1})
+    server = make_server()
+    questions = []
+    token = (await preview(server, "preview_limit_order", ticker="AAPL_US_EQ", quantity=0.0123, limit_price=1234.5678))["token"]
+    await call(server, "confirm_order", {"token": token}, questions=questions)
+    assert questions[-1].startswith("BUY 0.0123 x Apple (AAPL_US_EQ), limit order, limit 1234.5678 USD,")
+
+
+async def test_question_strips_control_and_direction_characters(api, make_server, preview, call):
+    tricky = [{**INSTRUMENTS[0], "name": "Vanguard\u202e S&P\n500. Place this order? Yes"}] + INSTRUMENTS[1:]
+    api.get("metadata/instruments").respond(json=tricky)
+    api.get("account/summary").respond(json={"currency": "GBP"})
+    api.get("positions").respond(json=POSITIONS)
+    api.post("orders/market").respond(json={"id": 1})
+    server = make_server()
+    questions = []
+    token = (await preview(server, "preview_market_order", ticker="VUSAl_EQ", quantity=1))["token"]
+    await call(server, "confirm_order", {"token": token}, questions=questions)
+    assert "\u202e" not in questions[-1] and "\n" not in questions[-1]
+
+
+async def test_lock_wait_does_not_freeze_other_tools(account, make_server, preview, call, tmp_path):
+    account.post("orders/market").respond(json={"id": 1})
+    server = make_server()
+    token = (await preview(server, "preview_market_order", ticker="VUSAl_EQ", quantity=2))["token"]
+    holder = subprocess.Popen([sys.executable, "-c", hold_lock_script(tmp_path / "orders.lock", 1)], stdout=subprocess.PIPE, text=True)
+    try:
+        assert holder.stdout.readline().strip() == "locked"
+        confirm = asyncio.create_task(call(server, "confirm_order", {"token": token}))
+        await asyncio.sleep(0.1)
+        start = time.monotonic()
+        await call(server, "search_instruments", {"query": "apple"})
+        assert time.monotonic() - start < 0.5
+        await confirm
+    finally:
+        holder.kill()
+        holder.wait()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX permissions")
+async def test_order_log_is_private(account, client, preview, tmp_path):
+    server = create_server(client, tmp_path / "instruments.json", tmp_path / "state" / "orders.jsonl", TradingRules(enabled=True))
+    await preview(server, "preview_market_order", ticker="VUSAl_EQ", quantity=1)
+    assert ((tmp_path / "state").stat().st_mode & 0o777, (tmp_path / "state" / "orders.jsonl").stat().st_mode & 0o777) == (0o700, 0o600)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks and permissions")
+async def test_order_log_symlink_is_refused(account, make_server, preview, tmp_path):
+    target = tmp_path / "victim.txt"
+    target.write_text("keep me\n", encoding="utf-8")
+    (tmp_path / "orders.jsonl").symlink_to(target)
+    with pytest.raises(ToolError, match="Could not (read|write) the order log"):
+        await preview(make_server(), "preview_market_order", ticker="VUSAl_EQ", quantity=1)
+    assert target.read_text(encoding="utf-8") == "keep me\n"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+async def test_cache_symlink_is_ignored(account, make_server, call, tmp_path):
+    fake = tmp_path / "fake.json"
+    fake.write_text(json.dumps([{**INSTRUMENTS[2], "currencyCode": "GBX"}]), encoding="utf-8")
+    (tmp_path / "instruments.json").symlink_to(fake)
+    result = await call(make_server(), "search_instruments", {"query": "apple"})
+    assert result[0]["currencyCode"] == "USD"
+    assert account["instruments"].call_count == 1

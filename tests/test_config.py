@@ -70,3 +70,8 @@ def test_bad_config_file(tmp_path, text, message, load):
     config.write_text(text, encoding="utf-8")
     with pytest.raises(ConfigError, match=message):
         load({"T212_CONFIG": str(config), **DEMO_KEYS})
+
+
+def test_settings_repr_hides_credentials(load):
+    text = repr(load({"T212_DEMO_API_KEY": "key-value", "T212_DEMO_API_SECRET": "secret-value"}))
+    assert "key-value" not in text and "secret-value" not in text
