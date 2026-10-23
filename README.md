@@ -7,10 +7,10 @@ It's an MCP server. MCP (Model Context Protocol) is the standard way to give an 
 ## Please read this first
 
 - This is a personal project. It isn't made by, affiliated with or endorsed by Trading 212.
-- It can place real trades with real money. It comes with no warranty (see [LICENSE](LICENSE)), and you're responsible for every order it places.
+- It can place real trades with real money. It comes with no warranty (see [LICENSE](https://github.com/watsonam/t212-mcp/blob/main/LICENSE)), and you're responsible for every order it places.
 - Start with a read-only API key. Only add trading permission once you're comfortable with how it works.
-- The only official copy is [github.com/watsonam/t212-mcp](https://github.com/watsonam/t212-mcp). It isn't on PyPI. A package with this name anywhere else isn't mine, and could be built to steal your key.
-- Found a security problem? Please report it privately, as described in [SECURITY.md](SECURITY.md).
+- The only official copies are this repository, [github.com/watsonam/t212-mcp](https://github.com/watsonam/t212-mcp), and the [`t212-mcp` package on PyPI](https://pypi.org/project/t212-mcp/), which is built and published from this repository by GitHub Actions. Anything else with a similar name isn't mine, and could be built to steal your key.
+- Found a security problem? Please report it privately, as described in [SECURITY.md](https://github.com/watsonam/t212-mcp/blob/main/SECURITY.md).
 
 ## Where things stand
 
@@ -48,11 +48,17 @@ The server checks these rules on every order, whatever the assistant asks for:
 
 ## Setting it up
 
-You'll need [uv](https://docs.astral.sh/uv/), a tool for running Python projects. Then clone this repository and, from inside it, run:
+You'll need [uv](https://docs.astral.sh/uv/), a tool for running Python projects. There are two ways to get the server.
+
+The quickest is from PyPI. uv downloads it the first time your AI app starts it, so there's nothing to install now. In the app snippets below, use `uvx` as the command and `["t212-mcp@0.1.0"]` as the arguments. Naming the version means you only move to a new one when you choose to.
+
+The other way is to clone this repository and, from inside it, run:
 
 ```bash
 uv sync
 ```
+
+A clone uses exactly the dependency versions the tests ran with, and you can read every change before you `git pull` it.
 
 Next, create an API key in the Trading 212 app, under Settings, then API. You'll get a key and a secret.
 
@@ -72,7 +78,7 @@ For a demo key, use `demo_api_key` and `demo_api_secret` instead. You can also s
 
 ## Connecting it to your AI app
 
-In each example, replace `/path/to/t212-mcp` with wherever you cloned this repository. The `--locked` flag makes uv use exactly the versions this repository was tested with, and `--no-dev` leaves out the test tools. On Windows, write the path with forward slashes, like `C:/Users/you/t212-mcp`, or double each backslash.
+The examples below use a clone. In each one, replace `/path/to/t212-mcp` with wherever you cloned this repository. The `--locked` flag makes uv use exactly the versions this repository was tested with, and `--no-dev` leaves out the test tools. On Windows, write the path with forward slashes, like `C:/Users/you/t212-mcp`, or double each backslash.
 
 `T212_ENV=live` points it at your real account. Leave it out to use the demo account.
 
@@ -80,6 +86,12 @@ In each example, replace `/path/to/t212-mcp` with wherever you cloned this repos
 
 ```bash
 claude mcp add trading212 -s user --env T212_ENV=live -- uv --directory /path/to/t212-mcp run --locked --no-dev t212-mcp
+```
+
+Or, from PyPI:
+
+```bash
+claude mcp add trading212 -s user --env T212_ENV=live -- uvx t212-mcp@0.1.0
 ```
 
 To allow live orders, add `--env T212_LIVE_TRADING=1`.
