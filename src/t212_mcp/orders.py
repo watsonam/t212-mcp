@@ -1,22 +1,27 @@
+import asyncio
+import errno
 import json
 import math
 import os
 import secrets
 import sys
 import time
-from collections.abc import Awaitable, Callable, Iterator
-from contextlib import contextmanager
+import unicodedata
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, BinaryIO, Literal
 
 from mcp.server.mcpserver.exceptions import ToolError
 
 from t212_mcp.client import T212Client, T212Error, T212NoAnswer
 from t212_mcp.config import TradingRules
 
-if sys.platform != "win32":
+if sys.platform == "win32":
+    import msvcrt
+else:
     import fcntl
 
 OrderKind = Literal["market", "limit", "stop", "stop_limit"]
@@ -27,6 +32,89 @@ DISABLED = "Live trading is off. Set T212_LIVE_TRADING=1 in the server's environ
 DECLINED = "Not approved, so nothing was sent. Preview the order again to retry."
 NO_ANSWER = "No usable answer from Trading 212, so the order may or may not have been placed. Do not resend it. Check get_pending_orders and get_order_history first."
 CANCEL_NO_ANSWER = "No usable answer from Trading 212, so the order may or may not have been cancelled. Check get_order or get_pending_orders."
+
+
+LOCK_POLL_SECONDS = 0.05
+LOCK_TIMEOUT_SECONDS = 10.0
+
+
+PRIVATE_OPEN_FLAGS = getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+DISPLAY_TEXT_LIMIT = 80
+
+
+def owned_by_me(info: os.stat_result) -> bool:
+    return sys.platform == "win32" or info.st_uid == os.getuid()
+
+
+def open_private(path: Path, flags: int, mode: str) -> BinaryIO:
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd = os.open(path, flags | os.O_CREAT | PRIVATE_OPEN_FLAGS, 0o600)
+    try:
+        if sys.platform != "win32":
+            if not owned_by_me(os.fstat(fd)):
+                raise PermissionError(f"{path} belongs to another user")
+            os.fchmod(fd, 0o600)
+        return os.fdopen(fd, mode)
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def exact(number: float) -> str:
+    return f"{number:.15g}"
+
+
+def display_text(text: Any) -> str:
+    return "".join(c for c in str(text) if not unicodedata.category(c).startswith("C"))[:DISPLAY_TEXT_LIMIT]
+
+
+LOCK_BUSY_ERRNOS = {errno.EACCES, errno.EDEADLK} if sys.platform == "win32" else {errno.EAGAIN, errno.EWOULDBLOCK}
+
+
+def try_lock(lock: BinaryIO) -> bool:
+    try:
+        if sys.platform == "win32":
+            lock.seek(0)
+            msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as error:
+        if error.errno in LOCK_BUSY_ERRNOS:
+            return False
+        raise
+    return True
+
+
+def unlock(lock: BinaryIO) -> None:
+    try:
+        if sys.platform == "win32":
+            lock.seek(0)
+            msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+    except OSError:
+        pass
+
+
+@asynccontextmanager
+async def hold_file_lock(path: Path) -> AsyncIterator[None]:
+    try:
+        lock = open_private(path, os.O_RDWR, "r+b")
+    except OSError as error:
+        raise ToolError(f"Could not open the order log lock {path}, so nothing was sent: {error}") from error
+    with lock:
+        deadline = time.monotonic() + LOCK_TIMEOUT_SECONDS
+        try:
+            while not try_lock(lock):
+                if time.monotonic() > deadline:
+                    raise ToolError(f"The order log lock {path} stayed busy for {LOCK_TIMEOUT_SECONDS:g}s, so nothing was sent")
+                await asyncio.sleep(LOCK_POLL_SECONDS)
+        except OSError as error:
+            raise ToolError(f"Could not lock the order log {path}, so nothing was sent: {error}") from error
+        try:
+            yield
+        finally:
+            unlock(lock)
 
 
 def position_price_gbp(position: dict[str, Any]) -> float:
@@ -57,32 +145,28 @@ class OrderDesk:
         self._account_currency: str | None = None
 
     def _log(self, event: str, sync: bool = False, **fields: Any) -> None:
-        self._log_path.parent.mkdir(parents=True, exist_ok=True)
         line = json.dumps({"time": datetime.now().astimezone().isoformat(), "event": event, **fields}) + "\n"
-        with self._log_path.open("a+b") as log:
-            if log.seek(0, os.SEEK_END):
-                log.seek(-1, os.SEEK_END)
-                if log.read(1) != b"\n":
-                    line = "\n" + line
-            log.write(line.encode("utf-8"))
-            if sync:
-                log.flush()
-                os.fsync(log.fileno())
-
-    @contextmanager
-    def _log_lock(self) -> Iterator[None]:
-        if sys.platform == "win32":
-            yield
-            return
-        self._log_path.parent.mkdir(parents=True, exist_ok=True)
-        with self._log_path.with_suffix(".lock").open("a") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
-            yield
+        try:
+            with open_private(self._log_path, os.O_RDWR | os.O_APPEND, "a+b") as log:
+                if log.seek(0, os.SEEK_END):
+                    log.seek(-1, os.SEEK_END)
+                    if log.read(1) != b"\n":
+                        line = "\n" + line
+                log.write(line.encode("utf-8"))
+                if sync:
+                    log.flush()
+                    os.fsync(log.fileno())
+        except OSError as error:
+            raise ToolError(f"Could not write the order log {self._log_path}, so nothing was sent: {error}") from error
 
     def _log_entries(self) -> Iterator[dict[str, Any]]:
-        if not self._log_path.exists():
+        try:
+            text = self._log_path.read_text(encoding="utf-8", errors="replace")
+        except FileNotFoundError:
             return
-        for line in self._log_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        except OSError as error:
+            raise ToolError(f"Could not read the order log {self._log_path}, so nothing was sent: {error}") from error
+        for line in text.splitlines():
             try:
                 entry = json.loads(line)
             except json.JSONDecodeError:
@@ -137,16 +221,16 @@ class OrderDesk:
         body = {"ticker": ticker, "quantity": quantity, **terms}
         side = "BUY" if quantity > 0 else "SELL"
         currency = "pence" if instrument["currencyCode"] == "GBX" else instrument["currencyCode"]
-        details = [f"{label} {terms[key]:g} {currency}" for key, label in (("limitPrice", "limit"), ("stopPrice", "stop")) if key in terms]
+        details = [f"{label} {exact(terms[key])} {currency}" for key, label in (("limitPrice", "limit"), ("stopPrice", "stop")) if key in terms]
         details += [{"DAY": "day only", "GOOD_TILL_CANCEL": "good till cancelled"}[terms["timeValidity"]]] if "timeValidity" in terms else []
         details += ["extended hours"] if terms.get("extendedHours") else []
-        summary = f"{side} {abs(quantity):g} x {instrument['name']} ({ticker}), {kind.replace('_', '-')} order{''.join(', ' + d for d in details)}, about £{value:,.2f}. Place this order?"
+        summary = f"{side} {exact(abs(quantity))} x {display_text(instrument['name'])} ({display_text(ticker)}), {kind.replace('_', '-')} order{''.join(', ' + d for d in details)}, about £{value:,.2f}. Place this order?"
         now = time.monotonic()
         self._pending = {t: p for t, p in self._pending.items() if p.expires > now}
         token = secrets.token_urlsafe(8)
-        self._pending[token] = PendingOrder(kind, body, value, now + self._token_seconds, summary)
         preview = {"token": token, "type": kind, "name": instrument["name"], "side": side, **body, "estimatedValueGbp": round(value, 2), "spentTodayGbp": round(spent, 2), "expiresInSeconds": self._token_seconds}
         self._log("preview", **preview)
+        self._pending[token] = PendingOrder(kind, body, value, now + self._token_seconds, summary)
         return preview
 
     def _price_gbp(self, kind: OrderKind, quantity: float, terms: dict[str, Any], instrument: dict[str, Any], held: dict[str, Any] | None, positions: list[dict[str, Any]]) -> float:
@@ -182,9 +266,18 @@ class OrderDesk:
         self._check_caps(pending.value_gbp)
         return pending.summary
 
-    def cancel_question(self, order_id: int) -> str:
+    async def cancel_question(self, order_id: int) -> str:
         self._require_enabled()
-        return f"Cancel pending order {order_id}?"
+        try:
+            order = await self._client.order(order_id)
+        except T212Error as error:
+            raise ToolError(f"Could not look up order {order_id}, so nothing was cancelled: {error}") from error
+        quantity = order.get("quantity") or 0
+        side = order.get("side") or ("SELL" if quantity < 0 else "BUY")
+        name = display_text((order.get("instrument") or {}).get("name") or order.get("ticker", ""))
+        prices = "".join(f", {label} {exact(order[key])}" for key, label in (("limitPrice", "limit"), ("stopPrice", "stop")) if isinstance(order.get(key), int | float))
+        kind = display_text(str(order.get("type", "")).lower().replace("_", "-"))
+        return f"Cancel order {order_id}: {side} {exact(abs(quantity))} x {name} ({display_text(order.get('ticker', ''))}), {kind} order{prices}?"
 
     async def confirm(self, token: str, approved: bool) -> dict[str, Any]:
         self._require_enabled()
@@ -193,7 +286,7 @@ class OrderDesk:
         if not approved:
             self._log("declined", token=token)
             raise ToolError(DECLINED)
-        with self._log_lock():
+        async with hold_file_lock(self._log_path.with_suffix(".lock")):
             self._check_caps(pending.value_gbp)
             self._log("sent", sync=True, token=token, kind=pending.kind, body=pending.body, valueGbp=pending.value_gbp)
         try:
@@ -213,8 +306,8 @@ class OrderDesk:
     def _log_quietly(self, event: str, **fields: Any) -> None:
         try:
             self._log(event, **fields)
-        except (OSError, TypeError, ValueError):
-            pass
+        except (ToolError, TypeError, ValueError) as error:
+            print(f"t212-mcp: could not log {event!r} to the order log: {error}", file=sys.stderr)
 
     async def cancel(self, order_id: int, approved: bool) -> str:
         self._require_enabled()
