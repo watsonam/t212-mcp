@@ -54,6 +54,8 @@ def create_server(client: T212Client, instrument_cache: Path, order_log: Path, r
         try:
             partial.write_text(json.dumps(items), encoding="utf-8")
             partial.replace(instrument_cache)
+        except OSError:
+            pass
         finally:
             partial.unlink(missing_ok=True)
         return items

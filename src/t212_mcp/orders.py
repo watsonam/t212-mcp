@@ -9,7 +9,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, BinaryIO, Literal
 
 from mcp.server.mcpserver.exceptions import ToolError
 
@@ -32,28 +32,47 @@ CANCEL_NO_ANSWER = "No usable answer from Trading 212, so the order may or may n
 
 
 LOCK_POLL_SECONDS = 0.05
+LOCK_TIMEOUT_SECONDS = 10.0
+
+
+def try_lock(lock: BinaryIO) -> bool:
+    try:
+        if sys.platform == "win32":
+            lock.seek(0)
+            msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return False
+    return True
+
+
+def unlock(lock: BinaryIO) -> None:
+    if sys.platform == "win32":
+        lock.seek(0)
+        msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+    else:
+        fcntl.flock(lock, fcntl.LOCK_UN)
 
 
 @contextmanager
 def hold_file_lock(path: Path) -> Iterator[None]:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.touch()
-    with path.open("r+b") as lock:
-        if sys.platform == "win32":
-            while True:
-                try:
-                    msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
-                    break
-                except OSError:
-                    time.sleep(LOCK_POLL_SECONDS)
-            try:
-                yield
-            finally:
-                lock.seek(0)
-                msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
-        else:
-            fcntl.flock(lock, fcntl.LOCK_EX)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch()
+        lock = path.open("r+b")
+    except OSError as error:
+        raise ToolError(f"Could not open the order log lock {path}, so nothing was sent: {error}") from error
+    with lock:
+        deadline = time.monotonic() + LOCK_TIMEOUT_SECONDS
+        while not try_lock(lock):
+            if time.monotonic() > deadline:
+                raise ToolError(f"The order log lock {path} stayed busy for {LOCK_TIMEOUT_SECONDS:g}s, so nothing was sent")
+            time.sleep(LOCK_POLL_SECONDS)
+        try:
             yield
+        finally:
+            unlock(lock)
 
 
 def position_price_gbp(position: dict[str, Any]) -> float:
@@ -84,17 +103,20 @@ class OrderDesk:
         self._account_currency: str | None = None
 
     def _log(self, event: str, sync: bool = False, **fields: Any) -> None:
-        self._log_path.parent.mkdir(parents=True, exist_ok=True)
         line = json.dumps({"time": datetime.now().astimezone().isoformat(), "event": event, **fields}) + "\n"
-        with self._log_path.open("a+b") as log:
-            if log.seek(0, os.SEEK_END):
-                log.seek(-1, os.SEEK_END)
-                if log.read(1) != b"\n":
-                    line = "\n" + line
-            log.write(line.encode("utf-8"))
-            if sync:
-                log.flush()
-                os.fsync(log.fileno())
+        try:
+            self._log_path.parent.mkdir(parents=True, exist_ok=True)
+            with self._log_path.open("a+b") as log:
+                if log.seek(0, os.SEEK_END):
+                    log.seek(-1, os.SEEK_END)
+                    if log.read(1) != b"\n":
+                        line = "\n" + line
+                log.write(line.encode("utf-8"))
+                if sync:
+                    log.flush()
+                    os.fsync(log.fileno())
+        except OSError as error:
+            raise ToolError(f"Could not write the order log {self._log_path}, so nothing was sent: {error}") from error
 
     def _log_entries(self) -> Iterator[dict[str, Any]]:
         if not self._log_path.exists():
@@ -230,7 +252,7 @@ class OrderDesk:
     def _log_quietly(self, event: str, **fields: Any) -> None:
         try:
             self._log(event, **fields)
-        except (OSError, TypeError, ValueError):
+        except (ToolError, TypeError, ValueError):
             pass
 
     async def cancel(self, order_id: int, approved: bool) -> str:

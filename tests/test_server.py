@@ -78,6 +78,13 @@ async def test_read_tool_network_error_says_no_answer(api, server, call):
         await call(server, "get_positions")
 
 
+async def test_cache_write_failure_still_returns_results(account, server, call, monkeypatch):
+    def refuse(self, target):
+        raise PermissionError("in use")
+    monkeypatch.setattr("pathlib.Path.replace", refuse)
+    assert [i["ticker"] for i in await call(server, "search_instruments", {"query": "apple"})] == ["AAPL_US_EQ"]
+
+
 async def test_api_errors_become_tool_errors(api, server, call):
     api.get("account/summary").respond(403)
     with pytest.raises(ToolError, match="account"):

@@ -11,7 +11,8 @@ from mcp.server.mcpserver.exceptions import ToolError
 
 from conftest import INSTRUMENTS
 from t212_mcp.config import TradingRules
-from t212_mcp.orders import OrderDesk
+from t212_mcp.orders import OrderDesk, hold_file_lock
+from t212_mcp.server import create_server
 
 
 @pytest.fixture
@@ -317,11 +318,46 @@ async def test_confirm_waits_for_another_process_holding_the_log_lock(account, m
     token = (await preview(server, "preview_market_order", ticker="VUSAl_EQ", quantity=2))["token"]
     script = f"import time; from pathlib import Path; from t212_mcp.orders import hold_file_lock\nwith hold_file_lock(Path({str(tmp_path / 'orders.lock')!r})):\n    print('locked', flush=True)\n    time.sleep(0.6)"
     holder = subprocess.Popen([sys.executable, "-c", script], stdout=subprocess.PIPE, text=True)
-    assert holder.stdout.readline().strip() == "locked"
-    start = time.monotonic()
-    await call(server, "confirm_order", {"token": token})
-    assert time.monotonic() - start >= 0.4
-    holder.wait()
+    try:
+        assert holder.stdout.readline().strip() == "locked"
+        start = time.monotonic()
+        await call(server, "confirm_order", {"token": token})
+        assert time.monotonic() - start >= 0.4
+    finally:
+        holder.kill()
+        holder.wait()
+
+
+async def test_busy_lock_times_out_without_sending(account, make_server, preview, call, tmp_path, monkeypatch):
+    route = account.post("orders/market").respond(json={"id": 1})
+    monkeypatch.setattr("t212_mcp.orders.LOCK_TIMEOUT_SECONDS", 0.2)
+    server = make_server()
+    token = (await preview(server, "preview_market_order", ticker="VUSAl_EQ", quantity=2))["token"]
+    script = f"import time; from pathlib import Path; from t212_mcp.orders import hold_file_lock\nwith hold_file_lock(Path({str(tmp_path / 'orders.lock')!r})):\n    print('locked', flush=True)\n    time.sleep(3)"
+    holder = subprocess.Popen([sys.executable, "-c", script], stdout=subprocess.PIPE, text=True)
+    try:
+        assert holder.stdout.readline().strip() == "locked"
+        with pytest.raises(ToolError, match="stayed busy"):
+            await call(server, "confirm_order", {"token": token})
+        assert route.call_count == 0
+    finally:
+        holder.kill()
+        holder.wait()
+
+
+async def test_unwritable_order_log_is_a_clear_error(account, client, tmp_path, preview):
+    blocker = tmp_path / "not-a-folder"
+    blocker.write_text("", encoding="utf-8")
+    server = create_server(client, tmp_path / "instruments.json", blocker / "orders.jsonl", TradingRules(enabled=True))
+    with pytest.raises(ToolError, match="Could not write the order log"):
+        await preview(server, "preview_market_order", ticker="VUSAl_EQ", quantity=2)
+
+
+def test_unopenable_lock_is_a_clear_error(tmp_path):
+    blocker = tmp_path / "not-a-folder"
+    blocker.write_text("", encoding="utf-8")
+    with pytest.raises(ToolError, match="nothing was sent"), hold_file_lock(blocker / "orders.lock"):
+        pass
 
 
 async def test_tiny_holding_is_refused(api, make_server, preview):
