@@ -9,6 +9,8 @@ It's an MCP server. MCP (Model Context Protocol) is the standard way to give an 
 - This is a personal project. It isn't made by, affiliated with or endorsed by Trading 212.
 - It can place real trades with real money. It comes with no warranty (see [LICENSE](LICENSE)), and you're responsible for every order it places.
 - Start with a read-only API key. Only add trading permission once you're comfortable with how it works.
+- The only official copy is [github.com/watsonam/t212-mcp](https://github.com/watsonam/t212-mcp). It isn't on PyPI. A package with this name anywhere else isn't mine, and could be built to steal your key.
+- Found a security problem? Please report it privately, as described in [SECURITY.md](SECURITY.md).
 
 ## Where things stand
 
@@ -22,9 +24,9 @@ It's an MCP server. MCP (Model Context Protocol) is the standard way to give an 
 Placing an order always takes two steps.
 
 1. The assistant asks for a preview. You get back what the order is: the share, buy or sell, how many, and roughly what it'll cost in pounds.
-2. The assistant asks to confirm. The server then asks you directly, in a pop-up from your AI app, whether to place it. If you say no, or close the question, nothing is sent.
+2. The assistant asks to confirm. The server then asks you directly, in a pop-up from your AI app, whether to place it. The question spells out the order exactly as it will be sent. If you say no, or close the question, nothing is sent.
 
-The question comes from the server itself, so the assistant can't answer it for you. That only holds if your app shows you the question. An app set to accept these questions automatically, or one that lets the model answer them, removes that protection. If your app can't show the question at all, the order is refused. Cancelling an order asks you the same way.
+The question comes from the server itself, so the assistant can't answer it for you. That only holds if your app shows you the question. An app set to accept these questions automatically, or one that lets the model answer them, removes that protection. If your app can't show the question at all, the order is refused. Cancelling an order asks you the same way, and tells you which order it is, for example "Cancel order 42: SELL 3 x Vanguard S&P 500 (VUSAl_EQ), stop order, stop 8500?".
 
 A preview lasts 5 minutes and can only be used once.
 
@@ -42,7 +44,7 @@ The server checks these rules on every order, whatever the assistant asks for:
 - London shares are often priced in pence, so a limit price for them is in pence too.
 - You can't sell more shares than you have available.
 - An order is never sent twice. If Trading 212 doesn't give a clear answer, the server says the outcome is unknown, counts it towards your daily cap, and tells the assistant to check your open orders and history before trying again. Cancellations work the same way.
-- Every preview, order and cancellation is written to a log on your computer, at `~/.local/state/t212-mcp/orders-<env>.jsonl`. Here `~` means your home folder (on Windows, `C:\Users\you`). The daily cap is worked out from this log, per calendar day, and the log is locked while it's checked, so two chats can't both slip under the cap at the same time.
+- Every preview, order and cancellation is written to a log on your computer, at `~/.local/state/t212-mcp/orders-<env>.jsonl`. Only your user account can read it. Here `~` means your home folder (on Windows, `C:\Users\you`). The daily cap is worked out from this log, per calendar day, and the log is locked while it's checked, so two chats can't both slip under the cap at the same time.
 
 ## Setting it up
 
@@ -70,14 +72,14 @@ For a demo key, use `demo_api_key` and `demo_api_secret` instead. You can also s
 
 ## Connecting it to your AI app
 
-In each example, replace `/path/to/t212-mcp` with wherever you cloned this repository. On Windows, write the path with forward slashes, like `C:/Users/you/t212-mcp`, or double each backslash.
+In each example, replace `/path/to/t212-mcp` with wherever you cloned this repository. The `--locked` flag makes uv use exactly the versions this repository was tested with, and `--no-dev` leaves out the test tools. On Windows, write the path with forward slashes, like `C:/Users/you/t212-mcp`, or double each backslash.
 
 `T212_ENV=live` points it at your real account. Leave it out to use the demo account.
 
 ### Claude Code
 
 ```bash
-claude mcp add trading212 -s user --env T212_ENV=live -- uv --directory /path/to/t212-mcp run t212-mcp
+claude mcp add trading212 -s user --env T212_ENV=live -- uv --directory /path/to/t212-mcp run --locked --no-dev t212-mcp
 ```
 
 To allow live orders, add `--env T212_LIVE_TRADING=1`.
@@ -91,7 +93,7 @@ Add this to `claude_desktop_config.json`. On a Mac it's in `~/Library/Applicatio
   "mcpServers": {
     "trading212": {
       "command": "uv",
-      "args": ["--directory", "/path/to/t212-mcp", "run", "t212-mcp"],
+      "args": ["--directory", "/path/to/t212-mcp", "run", "--locked", "--no-dev", "t212-mcp"],
       "env": {"T212_ENV": "live"}
     }
   }
@@ -110,7 +112,7 @@ Add this to `.vscode/mcp.json` in your workspace:
     "trading212": {
       "type": "stdio",
       "command": "uv",
-      "args": ["--directory", "/path/to/t212-mcp", "run", "t212-mcp"],
+      "args": ["--directory", "/path/to/t212-mcp", "run", "--locked", "--no-dev", "t212-mcp"],
       "env": {"T212_ENV": "live"}
     }
   }
@@ -128,7 +130,7 @@ Add this to `~/.codex/config.toml`:
 ```toml
 [mcp_servers.trading212]
 command = "uv"
-args = ["--directory", "/path/to/t212-mcp", "run", "t212-mcp"]
+args = ["--directory", "/path/to/t212-mcp", "run", "--locked", "--no-dev", "t212-mcp"]
 env = { T212_ENV = "live" }
 ```
 
