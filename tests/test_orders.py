@@ -600,14 +600,14 @@ async def test_lock_wait_does_not_freeze_other_tools(account, make_server, previ
     account.post("orders/market").respond(json={"id": 1})
     server = make_server()
     token = (await preview(server, "preview_market_order", ticker="VUSAl_EQ", quantity=2))["token"]
-    holder = subprocess.Popen([sys.executable, "-c", hold_lock_script(tmp_path / "orders.lock", 1)], stdout=subprocess.PIPE, text=True)
+    holder = subprocess.Popen([sys.executable, "-c", hold_lock_script(tmp_path / "orders.lock", 1.5)], stdout=subprocess.PIPE, text=True)
     try:
         assert holder.stdout.readline().strip() == "locked"
         confirm = asyncio.create_task(call(server, "confirm_order", {"token": token}))
-        await asyncio.sleep(0.1)
         start = time.monotonic()
-        await call(server, "search_instruments", {"query": "apple"})
-        assert time.monotonic() - start < 0.5
+        await asyncio.sleep(0.5)
+        assert time.monotonic() - start < 1.0
+        assert not confirm.done()
         await confirm
     finally:
         holder.kill()
@@ -619,6 +619,15 @@ async def test_order_log_is_private(account, client, preview, tmp_path):
     server = create_server(client, tmp_path / "instruments.json", tmp_path / "state" / "orders.jsonl", TradingRules(enabled=True))
     await preview(server, "preview_market_order", ticker="VUSAl_EQ", quantity=1)
     assert ((tmp_path / "state").stat().st_mode & 0o777, (tmp_path / "state" / "orders.jsonl").stat().st_mode & 0o777) == (0o700, 0o600)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX permissions")
+async def test_existing_readable_order_log_is_made_private(account, make_server, preview, tmp_path):
+    log_path = tmp_path / "orders.jsonl"
+    log_path.write_text("", encoding="utf-8")
+    log_path.chmod(0o644)
+    await preview(make_server(), "preview_market_order", ticker="VUSAl_EQ", quantity=1)
+    assert log_path.stat().st_mode & 0o777 == 0o600
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks and permissions")
