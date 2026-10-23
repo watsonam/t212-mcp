@@ -1,3 +1,4 @@
+import errno
 import json
 import math
 import os
@@ -35,6 +36,9 @@ LOCK_POLL_SECONDS = 0.05
 LOCK_TIMEOUT_SECONDS = 10.0
 
 
+LOCK_BUSY_ERRNOS = {errno.EACCES, errno.EDEADLK} if sys.platform == "win32" else {errno.EAGAIN, errno.EWOULDBLOCK}
+
+
 def try_lock(lock: BinaryIO) -> bool:
     try:
         if sys.platform == "win32":
@@ -42,17 +46,22 @@ def try_lock(lock: BinaryIO) -> bool:
             msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
         else:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        return False
+    except OSError as error:
+        if error.errno in LOCK_BUSY_ERRNOS:
+            return False
+        raise
     return True
 
 
 def unlock(lock: BinaryIO) -> None:
-    if sys.platform == "win32":
-        lock.seek(0)
-        msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
-    else:
-        fcntl.flock(lock, fcntl.LOCK_UN)
+    try:
+        if sys.platform == "win32":
+            lock.seek(0)
+            msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+    except OSError:
+        pass
 
 
 @contextmanager
@@ -65,10 +74,13 @@ def hold_file_lock(path: Path) -> Iterator[None]:
         raise ToolError(f"Could not open the order log lock {path}, so nothing was sent: {error}") from error
     with lock:
         deadline = time.monotonic() + LOCK_TIMEOUT_SECONDS
-        while not try_lock(lock):
-            if time.monotonic() > deadline:
-                raise ToolError(f"The order log lock {path} stayed busy for {LOCK_TIMEOUT_SECONDS:g}s, so nothing was sent")
-            time.sleep(LOCK_POLL_SECONDS)
+        try:
+            while not try_lock(lock):
+                if time.monotonic() > deadline:
+                    raise ToolError(f"The order log lock {path} stayed busy for {LOCK_TIMEOUT_SECONDS:g}s, so nothing was sent")
+                time.sleep(LOCK_POLL_SECONDS)
+        except OSError as error:
+            raise ToolError(f"Could not lock the order log {path}, so nothing was sent: {error}") from error
         try:
             yield
         finally:
@@ -119,9 +131,13 @@ class OrderDesk:
             raise ToolError(f"Could not write the order log {self._log_path}, so nothing was sent: {error}") from error
 
     def _log_entries(self) -> Iterator[dict[str, Any]]:
-        if not self._log_path.exists():
+        try:
+            text = self._log_path.read_text(encoding="utf-8", errors="replace")
+        except FileNotFoundError:
             return
-        for line in self._log_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        except OSError as error:
+            raise ToolError(f"Could not read the order log {self._log_path}, so nothing was sent: {error}") from error
+        for line in text.splitlines():
             try:
                 entry = json.loads(line)
             except json.JSONDecodeError:
@@ -183,9 +199,9 @@ class OrderDesk:
         now = time.monotonic()
         self._pending = {t: p for t, p in self._pending.items() if p.expires > now}
         token = secrets.token_urlsafe(8)
-        self._pending[token] = PendingOrder(kind, body, value, now + self._token_seconds, summary)
         preview = {"token": token, "type": kind, "name": instrument["name"], "side": side, **body, "estimatedValueGbp": round(value, 2), "spentTodayGbp": round(spent, 2), "expiresInSeconds": self._token_seconds}
         self._log("preview", **preview)
+        self._pending[token] = PendingOrder(kind, body, value, now + self._token_seconds, summary)
         return preview
 
     def _price_gbp(self, kind: OrderKind, quantity: float, terms: dict[str, Any], instrument: dict[str, Any], held: dict[str, Any] | None, positions: list[dict[str, Any]]) -> float:
@@ -252,8 +268,8 @@ class OrderDesk:
     def _log_quietly(self, event: str, **fields: Any) -> None:
         try:
             self._log(event, **fields)
-        except (ToolError, TypeError, ValueError):
-            pass
+        except (ToolError, TypeError, ValueError) as error:
+            print(f"t212-mcp: could not log {event!r} to the order log: {error}", file=sys.stderr)
 
     async def cancel(self, order_id: int, approved: bool) -> str:
         self._require_enabled()

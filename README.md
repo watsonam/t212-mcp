@@ -6,9 +6,9 @@ This project is not affiliated with or endorsed by Trading 212. It can place rea
 
 ## What works today
 
-- The read tools have been tested against a live Trading 212 account.
+- The account summary call has been made against a live Trading 212 account. The other read tools have only been tested against mocked HTTP responses.
 - The order tools have only been tested against mocked HTTP responses. They have not yet placed an order on Trading 212 itself.
-- In our use, Claude (in Claude Code and Claude Desktop) declined to place trades on the user's behalf. With Claude, expect the order tools to be limited to previews. Other clients and models may call `confirm_order`; every order still needs your approval in the client.
+- Claude (in Claude Code and Claude Desktop) may decline to place trades on your behalf. It did in our use, though that is observed behaviour and not guaranteed either way. Other clients and models may call `confirm_order`; every order still needs your approval in the client.
 - The server runs on macOS, Linux and Windows, on Python 3.11 or later. The tests run on all three systems for every push to `main` and every pull request.
 
 ## Tools

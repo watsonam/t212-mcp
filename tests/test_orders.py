@@ -1,9 +1,11 @@
 import asyncio
+import errno
 import json
 import subprocess
 import sys
 import time
 from datetime import datetime, timedelta
+from pathlib import Path
 
 import httpx
 import pytest
@@ -349,8 +351,20 @@ async def test_unwritable_order_log_is_a_clear_error(account, client, tmp_path, 
     blocker = tmp_path / "not-a-folder"
     blocker.write_text("", encoding="utf-8")
     server = create_server(client, tmp_path / "instruments.json", blocker / "orders.jsonl", TradingRules(enabled=True))
-    with pytest.raises(ToolError, match="Could not write the order log"):
+    with pytest.raises(ToolError, match="Could not (read|write) the order log"):
         await preview(server, "preview_market_order", ticker="VUSAl_EQ", quantity=2)
+
+
+async def test_failed_log_write_is_a_clear_error(account, make_server, preview, tmp_path, monkeypatch):
+    log_path = tmp_path / "orders.jsonl"
+    original = Path.open
+    def open_(self, mode="r", *args, **kwargs):
+        if self == log_path and "a" in mode:
+            raise PermissionError("in use")
+        return original(self, mode, *args, **kwargs)
+    monkeypatch.setattr(Path, "open", open_)
+    with pytest.raises(ToolError, match="Could not write the order log"):
+        await preview(make_server(), "preview_market_order", ticker="VUSAl_EQ", quantity=2)
 
 
 def test_unopenable_lock_is_a_clear_error(tmp_path):
@@ -461,3 +475,66 @@ def test_caps_refuse_values_that_cannot_be_compared(client, tmp_path, value):
     desk = OrderDesk(client, None, tmp_path / "orders.jsonl", TradingRules(enabled=True), 300)
     with pytest.raises(ToolError, match="Cannot cap"):
         desk._check_caps(value)
+
+
+def fail_logging_for(monkeypatch, *events):
+    original = OrderDesk._log
+    def log(self, event, sync=False, **fields):
+        if event in events:
+            raise ToolError("Could not write the order log, so nothing was sent: disk full")
+        original(self, event, sync, **fields)
+    monkeypatch.setattr(OrderDesk, "_log", log)
+
+
+async def test_placed_order_is_reported_even_if_logging_fails(account, make_server, preview, call, monkeypatch):
+    route = account.post("orders/market").respond(json={"id": 7})
+    server = make_server()
+    token = (await preview(server, "preview_market_order", ticker="VUSAl_EQ", quantity=2))["token"]
+    fail_logging_for(monkeypatch, "placed")
+    assert (await call(server, "confirm_order", {"token": token}))["id"] == 7
+    assert route.call_count == 1
+
+
+async def test_unknown_outcome_is_reported_even_if_logging_fails(account, make_server, preview, call, monkeypatch):
+    account.post("orders/market").mock(side_effect=httpx.ReadTimeout("slow"))
+    server = make_server()
+    token = (await preview(server, "preview_market_order", ticker="VUSAl_EQ", quantity=2))["token"]
+    fail_logging_for(monkeypatch, "unknown")
+    with pytest.raises(ToolError, match="Do not resend"):
+        await call(server, "confirm_order", {"token": token})
+
+
+async def test_rejection_is_reported_even_if_logging_fails(account, make_server, preview, call, monkeypatch):
+    account.post("orders/market").respond(400, text="market closed")
+    server = make_server()
+    token = (await preview(server, "preview_market_order", ticker="VUSAl_EQ", quantity=2))["token"]
+    fail_logging_for(monkeypatch, "rejected")
+    with pytest.raises(ToolError, match="market closed"):
+        await call(server, "confirm_order", {"token": token})
+
+
+async def test_cancel_is_reported_even_if_logging_fails(api, make_server, call, monkeypatch):
+    api.delete("orders/42").respond(200)
+    fail_logging_for(monkeypatch, "cancelled")
+    assert "accepted" in await call(make_server(), "cancel_order", {"order_id": 42})
+
+
+def test_lock_error_other_than_busy_is_a_clear_error(tmp_path, monkeypatch):
+    def broken(*args):
+        raise OSError(errno.ENOLCK, "No locks available")
+    monkeypatch.setattr("t212_mcp.orders.msvcrt.locking" if sys.platform == "win32" else "t212_mcp.orders.fcntl.flock", broken)
+    with pytest.raises(ToolError, match="Could not lock"), hold_file_lock(tmp_path / "orders.lock"):
+        pass
+
+
+async def test_unreadable_order_log_is_a_clear_error(account, make_server, preview, tmp_path, monkeypatch):
+    log_path = tmp_path / "orders.jsonl"
+    log_path.write_text("", encoding="utf-8")
+    original = Path.read_text
+    def read_text(self, *args, **kwargs):
+        if self == log_path:
+            raise PermissionError("in use")
+        return original(self, *args, **kwargs)
+    monkeypatch.setattr(Path, "read_text", read_text)
+    with pytest.raises(ToolError, match="Could not read the order log"):
+        await preview(make_server(), "preview_market_order", ticker="VUSAl_EQ", quantity=2)
