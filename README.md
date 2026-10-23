@@ -1,6 +1,6 @@
 # t212-mcp
 
-I built this so I could ask an AI assistant about my Trading 212 Stocks ISA: what I hold, what it's worth, what orders I have open and what I've traded before. It also lets the assistant set up an order for me, but nothing is ever placed until I say yes to it myself.
+I built this so I could ask an AI assistant about my Trading 212 Stocks ISA: what I hold, what it's worth, what orders I have open, what I've traded before, and the dividends and deposits that have come in. It also lets the assistant set up an order for me, but nothing is ever placed until I say yes to it myself.
 
 It's an MCP server. MCP (Model Context Protocol) is the standard way to give an AI app new tools, so this works with Claude Code, Claude Desktop, GitHub Copilot in VS Code, Cursor and other apps that support MCP.
 
@@ -50,7 +50,7 @@ The server checks these rules on every order, whatever the assistant asks for:
 
 You'll need [uv](https://docs.astral.sh/uv/), a tool for running Python projects. There are two ways to get the server.
 
-The quickest is from PyPI. uv downloads it the first time your AI app starts it, so there's nothing to install now. In the app snippets below, use `uvx` as the command and `["t212-mcp@0.1.0"]` as the arguments. Naming the version means you only move to a new one when you choose to.
+The quickest is from PyPI. uv downloads it the first time your AI app starts it, so there's nothing to install now. In the app snippets below, use `uvx` as the command and `["t212-mcp@0.1.1"]` as the arguments. Naming the version means you only move to a new one when you choose to.
 
 The other way is to clone this repository and, from inside it, run:
 
@@ -62,7 +62,7 @@ A clone uses exactly the dependency versions the tests ran with, and you can rea
 
 Next, create an API key in the Trading 212 app, under Settings, then API. You'll get a key and a secret.
 
-- To only read your account, tick account, portfolio, metadata, orders:read and history:orders.
+- To only read your account, tick account, portfolio, metadata, orders:read, history:orders, history:dividends and history:transactions.
 - To place orders too, also tick orders:execute.
 - If the app lets you, restrict the key to your home IP address.
 - The demo account and your real account need separate keys.
@@ -91,7 +91,7 @@ claude mcp add trading212 -s user --env T212_ENV=live -- uv --directory /path/to
 Or, from PyPI:
 
 ```bash
-claude mcp add trading212 -s user --env T212_ENV=live -- uvx t212-mcp@0.1.0
+claude mcp add trading212 -s user --env T212_ENV=live -- uvx t212-mcp@0.1.1
 ```
 
 To allow live orders, add `--env T212_LIVE_TRADING=1`.
@@ -175,7 +175,7 @@ The server won't start if the file has a typo, a setting it doesn't recognise, o
 
 ## Tools
 
-These are the tools your AI app can use, with the Trading 212 permission each one needs.
+These are the tools your AI app can use, with the Trading 212 permission each one needs. Each tool also tells your app whether it only reads or makes changes, so the app can be more careful with the ones that place or cancel orders.
 
 | Tool | What it does | Permission |
 | --- | --- | --- |
@@ -184,6 +184,8 @@ These are the tools your AI app can use, with the Trading 212 permission each on
 | `get_pending_orders` | Orders that haven't filled yet | orders:read |
 | `get_order` | One open order | orders:read |
 | `get_order_history` | Past orders, newest first | history:orders |
+| `get_dividends` | Dividends paid in, newest first | history:dividends |
+| `get_transactions` | Deposits, withdrawals, fees and interest, newest first | history:transactions |
 | `search_instruments` | Find a share's ticker by name, ticker or ISIN | metadata |
 | `preview_market_order` | Preview a market order | portfolio, metadata |
 | `preview_limit_order` | Preview a limit order | portfolio, metadata |

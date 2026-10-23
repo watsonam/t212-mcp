@@ -9,6 +9,7 @@ from typing import Annotated, Any, Literal
 from urllib.parse import parse_qs, urlparse
 
 from mcp.server.mcpserver import AcceptedElicitation, Elicit, ElicitationResult, MCPServer, Resolve
+from mcp.types import ToolAnnotations
 from pydantic import BaseModel, Field
 
 from t212_mcp.client import T212Client
@@ -31,10 +32,19 @@ class Approval(BaseModel):
     approve: bool
 
 
-def next_cursor(next_page_path: str | None) -> int | None:
+READS = ToolAnnotations(read_only_hint=True, open_world_hint=True)
+PLACES = ToolAnnotations(read_only_hint=False, destructive_hint=True, idempotent_hint=False, open_world_hint=True)
+CANCELS = ToolAnnotations(read_only_hint=False, destructive_hint=True, idempotent_hint=True, open_world_hint=True)
+
+
+def next_cursor(next_page_path: str | None) -> str | None:
     if not next_page_path or not (cursor := parse_qs(urlparse(next_page_path).query).get("cursor")):
         return None
-    return int(cursor[0])
+    return cursor[0]
+
+
+def next_number_cursor(next_page_path: str | None) -> int | None:
+    return int(cursor) if (cursor := next_cursor(next_page_path)) else None
 
 
 def approved(answer: ElicitationResult[Approval]) -> bool:
@@ -71,12 +81,12 @@ def create_server(client: T212Client, instrument_cache: Path, order_log: Path, r
     async def ask_to_cancel(order_id: int) -> Elicit[Approval]:
         return Elicit(await desk.cancel_question(order_id), Approval)
 
-    @server.tool()
+    @server.tool(title="Account summary", annotations=READS)
     async def get_account_summary() -> dict[str, Any]:
         """Cash, investments and total value of the account, in the account currency."""
         return await client.account_summary()
 
-    @server.tool()
+    @server.tool(title="Positions", annotations=READS)
     async def get_positions(ticker: str | None = None) -> list[dict[str, Any]]:
         """Open positions. currentPrice is in the instrument's own currency (London shares are often in pence, GBX); priceInAccountCurrency is the price per share in the account currency."""
         positions = await client.positions(ticker)
@@ -85,55 +95,67 @@ def create_server(client: T212Client, instrument_cache: Path, order_log: Path, r
                 position["priceInAccountCurrency"] = position_price_gbp(position)
         return positions
 
-    @server.tool()
+    @server.tool(title="Pending orders", annotations=READS)
     async def get_pending_orders() -> list[dict[str, Any]]:
         """Orders placed but not yet filled or cancelled."""
         return await client.pending_orders()
 
-    @server.tool()
+    @server.tool(title="Order status", annotations=READS)
     async def get_order(order_id: int) -> dict[str, Any]:
         """Status of one pending order."""
         return await client.order(order_id)
 
-    @server.tool()
+    @server.tool(title="Order history", annotations=READS)
     async def get_order_history(ticker: str | None = None, limit: HistoryLimit = 20, cursor: int | None = None) -> dict[str, Any]:
         """Filled, cancelled and rejected orders, newest first. limit is 1 to 50. Pass nextCursor back as cursor for the next page."""
         page = await client.order_history(cursor, ticker, limit)
+        return {"items": page["items"], "nextCursor": next_number_cursor(page.get("nextPagePath"))}
+
+    @server.tool(title="Dividends", annotations=READS)
+    async def get_dividends(ticker: str | None = None, limit: HistoryLimit = 20, cursor: int | None = None) -> dict[str, Any]:
+        """Dividends paid into the account, newest first. limit is 1 to 50. Pass nextCursor back as cursor for the next page."""
+        page = await client.dividends(cursor, ticker, limit)
+        return {"items": page["items"], "nextCursor": next_number_cursor(page.get("nextPagePath"))}
+
+    @server.tool(title="Transactions", annotations=READS)
+    async def get_transactions(since: str | None = None, limit: HistoryLimit = 20, cursor: str | None = None) -> dict[str, Any]:
+        """Deposits, withdrawals, fees, transfers and interest, newest first. since is an ISO 8601 time to start from. limit is 1 to 50. Pass nextCursor back as cursor for the next page."""
+        page = await client.transactions(cursor, since, limit)
         return {"items": page["items"], "nextCursor": next_cursor(page.get("nextPagePath"))}
 
-    @server.tool()
+    @server.tool(title="Search instruments", annotations=READS)
     async def search_instruments(query: str, limit: SearchLimit = 20) -> list[dict[str, Any]]:
         """Find tradable instruments by ticker, name, short name or ISIN (case-insensitive)."""
         needle = query.casefold()
         fields = ("ticker", "name", "shortName", "isin")
         return [i for i in await instruments() if any(needle in str(i.get(f, "")).casefold() for f in fields)][:limit]
 
-    @server.tool()
+    @server.tool(title="Preview market order", annotations=READS)
     async def preview_market_order(ticker: str, quantity: float, extended_hours: bool = False) -> dict[str, Any]:
         """Preview a market order. Buys are only allowed for instruments already held, since there is no price quote. Returns a token for confirm_order."""
         return await desk.preview("market", ticker, quantity, {"extendedHours": extended_hours})
 
-    @server.tool()
+    @server.tool(title="Preview limit order", annotations=READS)
     async def preview_limit_order(ticker: str, quantity: float, limit_price: float, time_validity: TimeValidity = "DAY") -> dict[str, Any]:
         """Preview a limit order. limit_price is in the instrument's own currency (pence for GBX). Returns a token for confirm_order."""
         return await desk.preview("limit", ticker, quantity, {"limitPrice": limit_price, "timeValidity": time_validity})
 
-    @server.tool()
+    @server.tool(title="Preview stop order", annotations=READS)
     async def preview_stop_order(ticker: str, quantity: float, stop_price: float, time_validity: TimeValidity = "DAY") -> dict[str, Any]:
         """Preview a stop order (a market order once the last traded price reaches stop_price). Sells only. Returns a token for confirm_order."""
         return await desk.preview("stop", ticker, quantity, {"stopPrice": stop_price, "timeValidity": time_validity})
 
-    @server.tool()
+    @server.tool(title="Preview stop-limit order", annotations=READS)
     async def preview_stop_limit_order(ticker: str, quantity: float, stop_price: float, limit_price: float, time_validity: TimeValidity = "DAY") -> dict[str, Any]:
         """Preview a stop-limit order (a limit order at limit_price once the last traded price reaches stop_price). Returns a token for confirm_order."""
         return await desk.preview("stop_limit", ticker, quantity, {"stopPrice": stop_price, "limitPrice": limit_price, "timeValidity": time_validity})
 
-    @server.tool()
+    @server.tool(title="Place order", annotations=PLACES)
     async def confirm_order(token: str, approval: Annotated[ElicitationResult[Approval], Resolve(ask_to_place)]) -> dict[str, Any]:
         """Place a previewed order. The server asks the user to approve it first; if they decline, nothing is sent. Each token works once."""
         return await desk.confirm(token, approved(approval))
 
-    @server.tool()
+    @server.tool(title="Cancel order", annotations=CANCELS)
     async def cancel_order(order_id: int, approval: Annotated[ElicitationResult[Approval], Resolve(ask_to_cancel)]) -> str:
         """Ask Trading 212 to cancel a pending order. The server asks the user to approve it first."""
         return await desk.cancel(order_id, approved(approval))
